@@ -27,13 +27,45 @@ function loadEnv() {
 
 loadEnv();
 
-const DATABASE_URL = process.env.DATABASE_URL || "postgresql://flymasters:flymasters@127.0.0.1:5433/flymasters";
+const IS_RAILWAY = Boolean(process.env.RAILWAY_ENVIRONMENT);
+const IS_PRODUCTION = process.env.NODE_ENV === "production" || IS_RAILWAY;
+
+function resolveDatabaseUrl() {
+  const configured = String(process.env.DATABASE_URL || "").trim();
+  if (configured) return configured;
+  if (IS_PRODUCTION) return "";
+  return "postgresql://flymasters:flymasters@127.0.0.1:5433/flymasters";
+}
+
+const DATABASE_URL = resolveDatabaseUrl();
+
+if (IS_PRODUCTION) {
+  if (!DATABASE_URL) {
+    console.error(
+      "Refusing to start: DATABASE_URL must be set in production.\n" +
+        "Railway: add a Postgres plugin, then reference ${{Postgres.DATABASE_URL}} on this service.",
+    );
+    process.exit(1);
+  }
+  if (/127\.0\.0\.1|localhost/i.test(DATABASE_URL)) {
+    console.error(
+      "Refusing to start: DATABASE_URL points to localhost and cannot work on Railway.\n" +
+        "Use your Railway Postgres reference or a cloud database URL.",
+    );
+    process.exit(1);
+  }
+  console.log("Production boot: DATABASE_URL is set, connecting to PostgreSQL…");
+}
+
 const JWT_SECRET = process.env.JWT_SECRET || "flymasters-counselor-dev-secret";
-const PORT = Number(process.env.API_PORT || 8787);
+const PORT = Number(process.env.PORT || process.env.API_PORT || 8787);
 
 const pool = new pg.Pool({
   connectionString: DATABASE_URL,
-  ssl: /supabase\.co|neon\.tech|amazonaws\.com/.test(DATABASE_URL) ? { rejectUnauthorized: false } : undefined,
+  ssl:
+    IS_PRODUCTION && !/127\.0\.0\.1|localhost/.test(DATABASE_URL)
+      ? { rejectUnauthorized: false }
+      : undefined,
 });
 
 async function ensureDatabase() {
@@ -42,7 +74,10 @@ async function ensureDatabase() {
   const adminUrl = DATABASE_URL.replace(/\/[^/?]+(\?|$)/, "/postgres$1");
   const admin = new pg.Client({
     connectionString: adminUrl,
-    ssl: /supabase\.co|neon\.tech|amazonaws\.com/.test(DATABASE_URL) ? { rejectUnauthorized: false } : undefined,
+    ssl:
+    IS_PRODUCTION && !/127\.0\.0\.1|localhost/.test(DATABASE_URL)
+      ? { rejectUnauthorized: false }
+      : undefined,
   });
   await admin.connect();
   const found = await admin.query("SELECT 1 FROM pg_database WHERE datname = $1", [dbName]);
@@ -53,7 +88,10 @@ async function ensureDatabase() {
 }
 
 async function applySchema() {
-  await ensureDatabase();
+  // Railway/managed Postgres already provides the database — skip local CREATE DATABASE.
+  if (!IS_PRODUCTION) {
+    await ensureDatabase();
+  }
   const sql = readFileSync(path.join(__dirname, "schema.sql"), "utf8");
   const statements = sql
     .split(";")
@@ -62,14 +100,18 @@ async function applySchema() {
   for (const statement of statements) {
     await pool.query(statement);
   }
-  await pool.query(`
-    DELETE FROM counselor_attendance a
-    WHERE a.ctid NOT IN (
-      SELECT min(ctid) FROM counselor_attendance GROUP BY counselor_id, date
-    )
-  `);
-  await pool.query("CREATE UNIQUE INDEX IF NOT EXISTS counselor_attendance_one_per_day ON counselor_attendance (counselor_id, date)");
-  await pool.query("CREATE UNIQUE INDEX IF NOT EXISTS counselor_salary_one_per_month ON counselor_salary_records (counselor_id, month, year)");
+  try {
+    await pool.query(`
+      DELETE FROM counselor_attendance a
+      WHERE a.ctid NOT IN (
+        SELECT min(ctid) FROM counselor_attendance GROUP BY counselor_id, date
+      )
+    `);
+    await pool.query("CREATE UNIQUE INDEX IF NOT EXISTS counselor_attendance_one_per_day ON counselor_attendance (counselor_id, date)");
+    await pool.query("CREATE UNIQUE INDEX IF NOT EXISTS counselor_salary_one_per_month ON counselor_salary_records (counselor_id, month, year)");
+  } catch (error) {
+    console.warn("Optional attendance/salary cleanup skipped:", error.message || error);
+  }
 }
 
 function signUser(user) {
@@ -1267,18 +1309,41 @@ app.post("/api/conversations/:id/read", auth, async (req, res) => {
   res.json({ ok: true });
 });
 
-applySchema()
-  .then(() => {
-    app.listen(PORT, () => {
-      console.log(`PostgreSQL API running on http://127.0.0.1:${PORT}`);
+if (IS_PRODUCTION) {
+  const distDir = path.join(root, "dist");
+  if (existsSync(distDir)) {
+    app.use(express.static(distDir));
+    app.get(/^(?!\/api(?:\/|$)).*/, (_req, res) => {
+      res.sendFile(path.join(distDir, "index.html"));
     });
-  })
-  .catch((error) => {
-    console.error("PostgreSQL connection failed.");
-    console.error(error.message);
-    console.error("Start the database with: docker compose up -d");
-    console.error("Then use DATABASE_URL=postgresql://flymasters:flymasters@127.0.0.1:5433/flymasters");
-    app.listen(PORT, () => {
-      console.log(`API running without database on http://127.0.0.1:${PORT}`);
+  }
+}
+
+app.use("/api", (_req, res) => {
+  res.status(404).json({ error: "Unknown API route." });
+});
+
+async function start() {
+  await new Promise((resolve) => {
+    app.listen(PORT, "0.0.0.0", () => {
+      console.log(`Fly Masters counselor API on port ${PORT}`);
+      resolve();
     });
   });
+
+  try {
+    await applySchema();
+    console.log("Database schema ready");
+  } catch (error) {
+    console.error("Database schema failed:", error.message || error);
+    if (!IS_PRODUCTION) {
+      console.error("Start the database with: docker compose up -d");
+      console.error("Then use DATABASE_URL=postgresql://flymasters:flymasters@127.0.0.1:5433/flymasters");
+    }
+  }
+}
+
+start().catch((error) => {
+  console.error("Counselor portal failed to start:", error.message || error);
+  process.exit(1);
+});

@@ -1,0 +1,8 @@
+# Prevent Nixpacks from serving Vite output as a static SPA (Caddy).
+# The counselor portal needs the Express API in server/index.mjs.
+[variables]
+NIXPACKS_SPA_CADDY = "false"
+RAILPACK_NO_SPA = "1"
+
+[start]
+cmd = "npm run start:prod"

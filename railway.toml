@@ -1,0 +1,12 @@
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# Requires DATABASE_URL (Railway Postgres → Variables → ${{Postgres.DATABASE_URL}})
+# and JWT_SECRET in the service environment. Without DATABASE_URL the Node server exits on boot.
+startCommand = "node server/index.mjs"
+healthcheckPath = "/api/health"
+healthcheckTimeout = 120
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10

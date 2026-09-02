@@ -39,7 +39,26 @@ export async function api<T = unknown>(path: string, options: { method?: string;
   } catch {
     throw new Error("Cannot reach the counselor API. Keep it running on port 8787 and try again.");
   }
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || "Request failed");
+  const raw = await res.text();
+  let data: { error?: string } = {};
+  try {
+    data = raw ? (JSON.parse(raw) as { error?: string }) : {};
+  } catch {
+    if (/<!doctype html|<html[\s>]/i.test(raw)) {
+      throw new Error(
+        "Counselor API is not running. On Railway, set DATABASE_URL from Postgres and redeploy with npm run start:prod (not static hosting only).",
+      );
+    }
+  }
+  if (!res.ok) {
+    const message = data.error;
+    if (message) throw new Error(message);
+    if (res.status === 404 || res.status === 405 || /<html[\s>]/i.test(raw)) {
+      throw new Error(
+        "Counselor API is not running. On Railway, set DATABASE_URL from Postgres and redeploy with npm run start:prod.",
+      );
+    }
+    throw new Error(`Request failed (${res.status})`);
+  }
   return data as T;
 }
