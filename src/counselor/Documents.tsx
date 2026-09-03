@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { format } from "date-fns";
-import { Download, FileText, Search } from "lucide-react";
+import { Link } from "react-router-dom";
+import { ClipboardList, Download, FileText, Search } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
 import { displayName } from "@/lib/utils";
 import { fetchDocumentFile, setDocumentStatus, useLocalStore } from "@/lib/store";
@@ -97,9 +98,16 @@ export default function Documents() {
           <h1 className="text-2xl font-bold">Documents</h1>
           <p className="text-slate-600">Files students upload are sent here. Review, then approve or reject.</p>
         </div>
-        <div className="relative w-full max-w-xs">
-          <Search className="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-slate-400" />
-          <Input className="pl-9" placeholder="Search student or file" value={query} onChange={(e) => setQuery(e.target.value)} />
+        <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto sm:justify-end">
+          <Link to="/counselor/documents/setup">
+            <Button variant="secondary">
+              <ClipboardList className="h-4 w-4" /> Set up
+            </Button>
+          </Link>
+          <div className="relative w-full max-w-xs sm:w-64">
+            <Search className="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-slate-400" />
+            <Input className="pl-9" placeholder="Search student or file" value={query} onChange={(e) => setQuery(e.target.value)} />
+          </div>
         </div>
       </div>
 
@@ -183,9 +191,16 @@ export default function Documents() {
             <p className="font-semibold">{docs.length === 0 ? "No student documents yet" : "No files match this filter"}</p>
             <p className="mt-1 text-sm text-slate-500">
               {docs.length === 0
-                ? "Ask the student to upload files at Student Portal → Documents. They appear here for you to approve or reject."
+                ? "Set up required document types first, then ask students to upload at Student Portal → Documents."
                 : "Try All, or pick a different student."}
             </p>
+            {docs.length === 0 && (
+              <Link to="/counselor/documents/setup" className="mt-4 inline-block">
+                <Button>
+                  <ClipboardList className="h-4 w-4" /> Set up documents
+                </Button>
+              </Link>
+            )}
           </Card>
         )}
       </div>

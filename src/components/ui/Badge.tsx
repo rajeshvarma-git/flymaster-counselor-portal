@@ -1,4 +1,5 @@
 import { cn } from "@/lib/utils";
+import type { ReactNode } from "react";
 import type { LeadStatus } from "@/lib/types";
 
 const styles: Record<string, string> = {
@@ -23,9 +24,11 @@ const styles: Record<string, string> = {
 export function Badge({
   value,
   className,
+  children,
 }: {
   value: LeadStatus | string;
   className?: string;
+  children?: ReactNode;
 }) {
   return (
     <span
@@ -35,7 +38,7 @@ export function Badge({
         className,
       )}
     >
-      {value.replace("_", " ")}
+      {children ?? value.replace("_", " ")}
     </span>
   );
 }

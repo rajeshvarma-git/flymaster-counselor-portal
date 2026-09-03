@@ -85,6 +85,7 @@ export interface LocalShortlist {
   student_id: string;
   student_email?: string;
   counselor_id: string;
+  university_id?: string;
   university_name: string;
   course_name: string;
   location: string;
@@ -235,6 +236,27 @@ export async function addAttendance(row: Omit<LocalAttendance, "id">) {
 export async function updateAttendance(id: string, update: Partial<LocalAttendance>) {
   await api(`/attendance/${id}`, { method: "PATCH", body: update });
   await refreshStore();
+}
+
+export async function fetchStudentChecklist(studentId: string) {
+  return api<{
+    student_id: string;
+    countries: string[];
+    degree: string;
+    items: Array<{
+      document_type: string;
+      description: string;
+      is_required: boolean;
+      status: string;
+      document_id: string | null;
+      file_name: string | null;
+      admin_comments: string;
+    }>;
+    required_total: number;
+    required_approved: number;
+    not_uploaded: number;
+    complete: boolean;
+  }>(`/students/${studentId}/checklist`);
 }
 
 export async function addShortlist(row: Omit<LocalShortlist, "id" | "created_at">) {

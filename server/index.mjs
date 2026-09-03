@@ -1309,6 +1309,370 @@ app.post("/api/conversations/:id/read", auth, async (req, res) => {
   res.json({ ok: true });
 });
 
+function catalogFilters({ q = "", country = "", university = "", degree = "", course = "" } = {}) {
+  const clauses = [];
+  const params = ["university_programs"];
+  let index = 2;
+
+  const exact = [
+    ["country", country],
+    ["university_name", university],
+    ["degree", degree],
+    ["course", course],
+  ];
+  for (const [field, value] of exact) {
+    const text = String(value || "").trim();
+    if (!text) continue;
+    clauses.push(`lower(data->>'${field}') = lower($${index})`);
+    params.push(text);
+    index += 1;
+  }
+
+  const needle = String(q || "").trim().toLowerCase();
+  if (needle) {
+    clauses.push(`(
+      lower(data->>'university_name') LIKE $${index} OR
+      lower(data->>'program_name') LIKE $${index} OR
+      lower(data->>'country') LIKE $${index} OR
+      lower(data->>'course') LIKE $${index} OR
+      lower(data->>'specialization') LIKE $${index} OR
+      lower(data->>'location') LIKE $${index}
+    )`);
+    params.push(`%${needle}%`);
+    index += 1;
+  }
+
+  const where = clauses.length ? `AND ${clauses.join(" AND ")}` : "";
+  return { where, params, nextIndex: index };
+}
+
+async function searchUniversityPrograms({
+  q = "",
+  country = "",
+  university = "",
+  degree = "",
+  course = "",
+  limit = 100,
+  offset = 0,
+} = {}) {
+  const safeLimit = Math.min(Math.max(Number(limit) || 100, 1), 500);
+  const safeOffset = Math.max(Number(offset) || 0, 0);
+  const { where, params } = catalogFilters({ q, country, university, degree, course });
+  const listParams = [...params, safeLimit, safeOffset];
+  const limitIndex = params.length + 1;
+  const offsetIndex = params.length + 2;
+
+  const [rowsResult, countResult] = await Promise.all([
+    pool.query(
+      `SELECT id, data
+       FROM app_records
+       WHERE table_name = $1
+       ${where}
+       ORDER BY lower(data->>'course'), lower(data->>'specialization'), lower(data->>'program_name')
+       LIMIT $${limitIndex} OFFSET $${offsetIndex}`,
+      listParams,
+    ),
+    pool.query(
+      `SELECT COUNT(*)::int AS count
+       FROM app_records
+       WHERE table_name = $1
+       ${where}`,
+      params,
+    ),
+  ]);
+  return {
+    rows: rowsResult.rows.map((row) => {
+      const data = row.data && typeof row.data === "object" ? row.data : {};
+      return { ...data, id: data.id || row.id };
+    }),
+    total: Number(countResult.rows[0]?.count || 0),
+    limit: safeLimit,
+    offset: safeOffset,
+  };
+}
+
+async function catalogCountries() {
+  const result = await pool.query(
+    `SELECT
+       data->>'country' AS name,
+       COUNT(DISTINCT data->>'university_name')::int AS university_count,
+       COUNT(*)::int AS program_count
+     FROM app_records
+     WHERE table_name = $1 AND coalesce(data->>'country', '') <> ''
+     GROUP BY data->>'country'
+     ORDER BY lower(data->>'country')`,
+    ["university_programs"],
+  );
+  return result.rows.map((row) => ({
+    name: row.name || "Unknown",
+    university_count: Number(row.university_count || 0),
+    program_count: Number(row.program_count || 0),
+  }));
+}
+
+async function catalogUniversities(country) {
+  const result = await pool.query(
+    `SELECT
+       data->>'university_name' AS name,
+       MAX(data->>'location') AS location,
+       COUNT(*)::int AS program_count
+     FROM app_records
+     WHERE table_name = $1 AND lower(data->>'country') = lower($2)
+     GROUP BY data->>'university_name'
+     ORDER BY lower(data->>'university_name')`,
+    ["university_programs", country],
+  );
+  return result.rows.map((row) => ({
+    name: row.name || "Unknown",
+    location: row.location || "",
+    program_count: Number(row.program_count || 0),
+  }));
+}
+
+async function catalogDegrees(country, university) {
+  const result = await pool.query(
+    `SELECT
+       coalesce(nullif(data->>'degree', ''), 'Other') AS name,
+       COUNT(*)::int AS program_count
+     FROM app_records
+     WHERE table_name = $1
+       AND lower(data->>'country') = lower($2)
+       AND lower(data->>'university_name') = lower($3)
+     GROUP BY coalesce(nullif(data->>'degree', ''), 'Other')
+     ORDER BY lower(coalesce(nullif(data->>'degree', ''), 'Other'))`,
+    ["university_programs", country, university],
+  );
+  return result.rows.map((row) => ({
+    name: row.name || "Other",
+    program_count: Number(row.program_count || 0),
+  }));
+}
+
+function checklistApplies(item, countries, degree) {
+  const wanted = countries.map((value) => String(value).trim().toLowerCase()).filter(Boolean);
+  const itemCountries = [item.country, ...(item.countries || [])]
+    .filter(Boolean)
+    .map((value) => String(value).trim().toLowerCase());
+  const countryOk =
+    !itemCountries.length ||
+    itemCountries.includes("all") ||
+    (wanted.length > 0 && itemCountries.some((value) => wanted.includes(value)));
+
+  const itemDegrees = [item.degree_type, ...(item.degree_types || [])]
+    .filter(Boolean)
+    .map((value) => String(value).trim().toLowerCase());
+  const degreeOk =
+    !itemDegrees.length ||
+    itemDegrees.includes("all") ||
+    (degree ? itemDegrees.includes(String(degree).trim().toLowerCase()) : true);
+
+  return countryOk && degreeOk;
+}
+
+async function counselorOwnsStudent(counselorId, studentRef) {
+  const ref = String(studentRef || "");
+  if (!ref) return false;
+  const [sqlLeads, jsonLeads] = await Promise.all([
+    pool.query("SELECT * FROM student_leads").catch(() => ({ rows: [] })),
+    jsonTable("student_leads").catch(() => []),
+  ]);
+  const leads = mergeStudents(
+    sqlLeads.rows.map((row) => asLead(row, counselorId)),
+    jsonLeads,
+  );
+  return leads.some(
+    (lead) =>
+      String(lead.assigned_counselor_id) === String(counselorId) &&
+      (String(lead.id) === ref || String(lead.user_id) === ref),
+  );
+}
+
+app.get("/api/university-catalog/countries", auth, async (_req, res) => {
+  try {
+    res.json(await catalogCountries());
+  } catch (error) {
+    res.status(500).json({ error: error.message || "Could not load countries." });
+  }
+});
+
+app.get("/api/university-catalog/universities", auth, async (req, res) => {
+  try {
+    const country = String(req.query.country || "").trim();
+    if (!country) return res.status(400).json({ error: "Country is required." });
+    res.json(await catalogUniversities(country));
+  } catch (error) {
+    res.status(500).json({ error: error.message || "Could not load universities." });
+  }
+});
+
+app.get("/api/university-catalog/degrees", auth, async (req, res) => {
+  try {
+    const country = String(req.query.country || "").trim();
+    const university = String(req.query.university || "").trim();
+    if (!country || !university) {
+      return res.status(400).json({ error: "Country and university are required." });
+    }
+    res.json(await catalogDegrees(country, university));
+  } catch (error) {
+    res.status(500).json({ error: error.message || "Could not load degree types." });
+  }
+});
+
+app.get("/api/university-programs", auth, async (req, res) => {
+  try {
+    const result = await searchUniversityPrograms({
+      q: req.query.q,
+      country: req.query.country,
+      university: req.query.university,
+      degree: req.query.degree,
+      course: req.query.course,
+      limit: req.query.limit,
+      offset: req.query.offset,
+    });
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message || "Could not load university programs." });
+  }
+});
+
+app.get("/api/students/:id/checklist", auth, async (req, res) => {
+  try {
+    const owns = await counselorOwnsStudent(req.user.id, req.params.id);
+    if (!owns) return res.status(403).json({ error: "This student is not assigned to you." });
+
+    const [sqlLeads, jsonLeads] = await Promise.all([
+      pool.query("SELECT * FROM student_leads").catch(() => ({ rows: [] })),
+      jsonTable("student_leads").catch(() => []),
+    ]);
+    const leads = mergeStudents(
+      sqlLeads.rows.map((row) => asLead(row, req.user.id)),
+      jsonLeads,
+    );
+    const student = leads.find(
+      (row) => String(row.id) === String(req.params.id) || String(row.user_id) === String(req.params.id),
+    );
+    if (!student) return res.status(404).json({ error: "Student not found." });
+
+    const [items, sqlDocs, jsonDocs] = await Promise.all([
+      jsonTable("document_checklists"),
+      pool.query("SELECT * FROM documents").catch(() => ({ rows: [] })),
+      jsonTable("documents"),
+    ]);
+
+    const ownsDoc = (ownerId) =>
+      ownerId != null &&
+      (String(ownerId) === String(student.user_id) || String(ownerId) === String(student.id));
+    const docs = mergeById(sqlDocs.rows.map(asDocument), jsonDocs.map(asDocument))
+      .filter((doc) => !doc.archived && ownsDoc(doc.user_id));
+
+    const countries = student.preferred_countries || [];
+    const degree = student.qualification_level || student.degree_level || "";
+
+    const applicable = items
+      .filter((item) => item.is_active !== false)
+      .filter((item) => checklistApplies(item, countries, degree))
+      .sort((a, b) => Number(a.display_order || 99) - Number(b.display_order || 99));
+
+    const checklist = applicable.map((item) => {
+      const match = docs.find(
+        (doc) => String(doc.document_type || "").trim().toLowerCase() === String(item.document_type).trim().toLowerCase(),
+      );
+      return {
+        document_type: item.document_type,
+        description: item.description || "",
+        is_required: item.is_required !== false,
+        allowed_file_types: item.allowed_file_types || [],
+        max_file_size_mb: item.max_file_size_mb || 20,
+        status: match ? match.status : "requested",
+        document_id: match?.id || null,
+        file_name: match?.file_name || null,
+        admin_comments: match?.admin_comments || "",
+        uploaded_at: match?.created_at || null,
+      };
+    });
+
+    const required = checklist.filter((row) => row.is_required);
+    res.json({
+      student_id: String(student.user_id || student.id),
+      countries,
+      degree,
+      items: checklist,
+      required_total: required.length,
+      required_approved: required.filter((row) => row.status === "approved").length,
+      awaiting_review: checklist.filter((row) => row.status === "uploaded" || row.status === "pending").length,
+      not_uploaded: checklist.filter((row) => row.status === "requested").length,
+      complete: required.length > 0 && required.every((row) => row.status === "approved"),
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message || "Could not build the checklist." });
+  }
+});
+
+app.get("/api/checklists", auth, async (_req, res) => {
+  try {
+    const items = await jsonTable("document_checklists");
+    items.sort((a, b) => Number(a.display_order || 99) - Number(b.display_order || 99));
+    res.json(items);
+  } catch (error) {
+    res.status(500).json({ error: error.message || "Could not load document types." });
+  }
+});
+
+app.post("/api/checklists", auth, async (req, res) => {
+  try {
+    const allowed = Array.isArray(req.body.allowed_file_types)
+      ? req.body.allowed_file_types
+      : String(req.body.allowed_file_types || "pdf,jpg,png")
+          .split(",")
+          .map((item) => item.trim())
+          .filter(Boolean);
+    const countries = Array.isArray(req.body.countries)
+      ? req.body.countries
+      : String(req.body.countries || req.body.country || "All")
+          .split(",")
+          .map((item) => item.trim())
+          .filter(Boolean);
+    const degreeTypes = Array.isArray(req.body.degree_types)
+      ? req.body.degree_types
+      : String(req.body.degree_types || req.body.degree_type || "All")
+          .split(",")
+          .map((item) => item.trim())
+          .filter(Boolean);
+    const payload = {
+      id: req.body.id || `dc-${crypto.randomUUID()}`,
+      document_type: String(req.body.document_type || "").trim(),
+      description: String(req.body.description || ""),
+      is_required: req.body.is_required !== false,
+      is_active: req.body.is_active !== false,
+      max_file_size_mb: Number(req.body.max_file_size_mb || 20),
+      allowed_file_types: allowed,
+      country: countries[0] || "All",
+      countries: countries.length ? countries : ["All"],
+      degree_type: degreeTypes[0] || "All",
+      degree_types: degreeTypes.length ? degreeTypes : ["All"],
+      display_order: Number(req.body.display_order || 99),
+    };
+    if (!payload.document_type) return res.status(400).json({ error: "Document type is required." });
+    await jsonUpsert("document_checklists", payload);
+    res.json(payload);
+  } catch (error) {
+    res.status(500).json({ error: error.message || "Could not add document type." });
+  }
+});
+
+app.patch("/api/checklists/:id", auth, async (req, res) => {
+  try {
+    const items = await jsonTable("document_checklists");
+    const found = items.find((row) => String(row.id) === String(req.params.id));
+    if (!found) return res.status(404).json({ error: "Document type not found." });
+    const next = { ...found, ...req.body, id: found.id };
+    await jsonUpsert("document_checklists", next);
+    res.json(next);
+  } catch (error) {
+    res.status(500).json({ error: error.message || "Could not update document type." });
+  }
+});
+
 if (IS_PRODUCTION) {
   const distDir = path.join(root, "dist");
   if (existsSync(distDir)) {

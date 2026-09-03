@@ -1,8 +1,9 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { format } from "date-fns";
 import {
   Calendar,
+  ClipboardList,
   FileText,
   GraduationCap,
   Mail,
@@ -13,7 +14,7 @@ import {
   Users,
 } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
-import { ensureConversation, useLocalStore } from "@/lib/store";
+import { ensureConversation, fetchStudentChecklist, useLocalStore } from "@/lib/store";
 import { displayName, initials } from "@/lib/utils";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
@@ -42,6 +43,7 @@ export default function MyStudents() {
   const store = useLocalStore();
   const [query, setQuery] = useState("");
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [checklist, setChecklist] = useState<Awaited<ReturnType<typeof fetchStudentChecklist>> | null>(null);
 
   const students = useMemo(() => {
     const seen = new Set<string>();
@@ -83,6 +85,16 @@ export default function MyStudents() {
     if (!user) return;
     await ensureConversation(user.id, studentId);
   };
+
+  useEffect(() => {
+    if (!selected) {
+      setChecklist(null);
+      return;
+    }
+    void fetchStudentChecklist(selected.user_id || selected.id)
+      .then(setChecklist)
+      .catch(() => setChecklist(null));
+  }, [selected?.id, selected?.user_id]);
 
   return (
     <div>
@@ -231,6 +243,44 @@ export default function MyStudents() {
                       <p className="text-slate-500">{item.course_name} · {item.location}</p>
                     </div>
                   ))}
+                </div>
+              </div>
+            )}
+
+            {checklist && (
+              <div className="mt-5">
+                <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <ClipboardList className="h-4 w-4 text-sky-500" />
+                    <p className="text-sm font-semibold">Document checklist</p>
+                  </div>
+                  <Badge
+                    value={checklist.complete ? "approved" : checklist.required_approved > 0 ? "uploaded" : "requested"}
+                    className="normal-case"
+                  >
+                    {checklist.required_approved} of {checklist.required_total} required approved
+                  </Badge>
+                </div>
+                <p className="mb-2 text-xs text-slate-500">
+                  Based on {checklist.countries.join(", ") || "no preferred country yet"}
+                  {checklist.degree ? ` · ${checklist.degree}` : ""}
+                </p>
+                <div className="space-y-2">
+                  {checklist.items.map((item) => (
+                    <div key={item.document_type} className="flex items-start justify-between gap-3 rounded-xl bg-slate-50 px-3 py-2 text-sm">
+                      <div>
+                        <p className="font-medium">{item.document_type}</p>
+                        {item.description ? <p className="text-slate-500">{item.description}</p> : null}
+                        {item.file_name ? <p className="text-xs text-slate-400">{item.file_name}</p> : null}
+                      </div>
+                      <Badge value={item.status === "approved" ? "approved" : item.status === "rejected" ? "rejected" : item.status === "requested" ? "requested" : "uploaded"} />
+                    </div>
+                  ))}
+                  {checklist.items.length === 0 && (
+                    <p className="text-sm text-slate-500">
+                      No checklist items match this student yet. Ask an admin to add document types under Catalog → Document lists.
+                    </p>
+                  )}
                 </div>
               </div>
             )}

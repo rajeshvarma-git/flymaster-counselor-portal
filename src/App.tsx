@@ -11,6 +11,7 @@ import MyStudents from "@/counselor/MyStudents";
 import Shortlists from "@/counselor/Shortlists";
 import CounselorChat from "@/counselor/CounselorChat";
 import Documents from "@/counselor/Documents";
+import DocumentsSetup from "@/counselor/DocumentsSetup";
 import Applications from "@/counselor/Applications";
 import {
   AttendancePage,
@@ -72,6 +73,7 @@ export default function App() {
             <Route path="shortlists" element={<Shortlists />} />
             <Route path="chat" element={<CounselorChat />} />
             <Route path="documents" element={<Documents />} />
+            <Route path="documents/setup" element={<DocumentsSetup />} />
             <Route path="applications" element={<Applications />} />
             <Route path="notifications" element={<NotificationsPage />} />
             <Route path="profile" element={<CounselorProfile />} />
