@@ -1553,10 +1553,11 @@ app.get("/api/students/:id/checklist", auth, async (req, res) => {
     );
     if (!student) return res.status(404).json({ error: "Student not found." });
 
-    const [items, sqlDocs, jsonDocs] = await Promise.all([
+    const [items, sqlDocs, jsonDocs, requests] = await Promise.all([
       jsonTable("document_checklists"),
       pool.query("SELECT * FROM documents").catch(() => ({ rows: [] })),
       jsonTable("documents"),
+      jsonTable("document_requests").catch(() => []),
     ]);
 
     const ownsDoc = (ownerId) =>
@@ -1573,9 +1574,17 @@ app.get("/api/students/:id/checklist", auth, async (req, res) => {
       .filter((item) => checklistApplies(item, countries, degree))
       .sort((a, b) => Number(a.display_order || 99) - Number(b.display_order || 99));
 
+    const studentUserId = String(student.user_id || student.id);
+    const pendingRequests = requests.filter(
+      (row) => String(row.student_id) === studentUserId && String(row.status || "pending") === "pending",
+    );
+
     const checklist = applicable.map((item) => {
       const match = docs.find(
         (doc) => String(doc.document_type || "").trim().toLowerCase() === String(item.document_type).trim().toLowerCase(),
+      );
+      const request = pendingRequests.find(
+        (row) => String(row.document_type || "").trim().toLowerCase() === String(item.document_type).trim().toLowerCase(),
       );
       return {
         document_type: item.document_type,
@@ -1588,12 +1597,15 @@ app.get("/api/students/:id/checklist", auth, async (req, res) => {
         file_name: match?.file_name || null,
         admin_comments: match?.admin_comments || "",
         uploaded_at: match?.created_at || null,
+        request_id: request?.id || null,
+        request_sent: Boolean(request),
+        request_sent_at: request?.created_at || null,
       };
     });
 
     const required = checklist.filter((row) => row.is_required);
     res.json({
-      student_id: String(student.user_id || student.id),
+      student_id: studentUserId,
       countries,
       degree,
       items: checklist,
@@ -1605,6 +1617,143 @@ app.get("/api/students/:id/checklist", auth, async (req, res) => {
     });
   } catch (error) {
     res.status(500).json({ error: error.message || "Could not build the checklist." });
+  }
+});
+
+async function resolveAssignedStudent(counselorId, studentRef) {
+  const [sqlLeads, jsonLeads] = await Promise.all([
+    pool.query("SELECT * FROM student_leads").catch(() => ({ rows: [] })),
+    jsonTable("student_leads").catch(() => []),
+  ]);
+  const leads = mergeStudents(
+    sqlLeads.rows.map((row) => asLead(row, counselorId)),
+    jsonLeads,
+  );
+  return leads.find(
+    (row) =>
+      String(row.assigned_counselor_id) === String(counselorId) &&
+      (String(row.id) === String(studentRef) || String(row.user_id) === String(studentRef)),
+  );
+}
+
+function needsDocumentRequest(status) {
+  return !status || status === "requested" || status === "rejected";
+}
+
+app.post("/api/students/:id/document-requests", auth, async (req, res) => {
+  try {
+    const student = await resolveAssignedStudent(req.user.id, req.params.id);
+    if (!student) return res.status(403).json({ error: "This student is not assigned to you." });
+
+    const requestedTypes = Array.isArray(req.body.document_types)
+      ? req.body.document_types.map((item) => String(item || "").trim()).filter(Boolean)
+      : String(req.body.document_type || "").trim()
+        ? [String(req.body.document_type).trim()]
+        : [];
+    if (!requestedTypes.length) {
+      return res.status(400).json({ error: "Select at least one document to request." });
+    }
+
+    const studentUserId = String(student.user_id || student.id);
+    const [checklistItems, existingRequests, sqlDocs, jsonDocs] = await Promise.all([
+      jsonTable("document_checklists"),
+      jsonTable("document_requests").catch(() => []),
+      pool.query("SELECT * FROM documents").catch(() => ({ rows: [] })),
+      jsonTable("documents"),
+    ]);
+
+    const ownsDoc = (ownerId) =>
+      ownerId != null &&
+      (String(ownerId) === studentUserId || String(ownerId) === String(student.id));
+    const docs = mergeById(sqlDocs.rows.map(asDocument), jsonDocs.map(asDocument))
+      .filter((doc) => !doc.archived && ownsDoc(doc.user_id));
+
+    const now = new Date().toISOString();
+    const created = [];
+    const skipped = [];
+
+    for (const documentType of requestedTypes) {
+      const checklistItem = checklistItems.find(
+        (item) => String(item.document_type || "").trim().toLowerCase() === documentType.trim().toLowerCase(),
+      );
+      const match = docs.find(
+        (doc) => String(doc.document_type || "").trim().toLowerCase() === documentType.trim().toLowerCase(),
+      );
+      const currentStatus = match ? match.status : "requested";
+      if (!needsDocumentRequest(currentStatus)) {
+        skipped.push({ document_type: documentType, reason: "already_submitted" });
+        continue;
+      }
+
+      const existing = existingRequests.find(
+        (row) =>
+          String(row.student_id) === studentUserId &&
+          String(row.document_type || "").trim().toLowerCase() === documentType.trim().toLowerCase() &&
+          String(row.status || "pending") === "pending",
+      );
+      if (existing) {
+        const refreshed = { ...existing, updated_at: now };
+        await jsonUpsert("document_requests", refreshed);
+        created.push(refreshed);
+        continue;
+      }
+
+      const payload = {
+        id: crypto.randomUUID(),
+        student_id: studentUserId,
+        requested_by: req.user.id,
+        document_type: checklistItem?.document_type || documentType,
+        description: checklistItem?.description || "",
+        is_mandatory: checklistItem?.is_required !== false,
+        max_file_size_mb: checklistItem?.max_file_size_mb || 20,
+        allowed_file_types: checklistItem?.allowed_file_types || ["pdf", "jpg", "jpeg", "png"],
+        status: "pending",
+        created_at: now,
+        updated_at: now,
+      };
+      await jsonUpsert("document_requests", payload);
+      created.push(payload);
+    }
+
+    if (!created.length) {
+      return res.status(400).json({
+        error: skipped.length
+          ? "These documents were already submitted or are awaiting review."
+          : "No documents could be requested.",
+        skipped,
+      });
+    }
+
+    const names = created.map((row) => row.document_type).join(", ");
+    const title = created.length === 1 ? "Document requested" : "Documents requested";
+    const message = created.length === 1
+      ? `Your counselor has requested ${names}. Please upload it in your student portal.`
+      : `Your counselor has requested these documents: ${names}. Please upload them in your student portal.`;
+
+    await jsonUpsert("document_notifications", {
+      id: crypto.randomUUID(),
+      user_id: studentUserId,
+      notification_type: "request",
+      title,
+      message,
+      action_url: "/student/documents",
+      created_at: now,
+      is_read: false,
+    });
+    await jsonUpsert("notifications", {
+      id: crypto.randomUUID(),
+      user_id: studentUserId,
+      title,
+      message,
+      type: "warning",
+      action_url: "/student/documents",
+      created_at: now,
+      is_read: false,
+    });
+
+    res.json({ ok: true, requests: created, skipped });
+  } catch (error) {
+    res.status(500).json({ error: error.message || "Could not send document request." });
   }
 });
 

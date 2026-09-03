@@ -10,11 +10,12 @@ import {
   MessageCircle,
   Phone,
   Search,
+  Send,
   Target,
   Users,
 } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
-import { ensureConversation, fetchStudentChecklist, useLocalStore } from "@/lib/store";
+import { ensureConversation, fetchStudentChecklist, requestStudentDocuments, useLocalStore } from "@/lib/store";
 import { displayName, initials } from "@/lib/utils";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
@@ -38,12 +39,19 @@ function joinedOn(value?: string) {
   return format(date, "MMM d, yyyy");
 }
 
+function canRequestDocument(status: string) {
+  return status === "requested" || status === "rejected";
+}
+
 export default function MyStudents() {
   const { user } = useAuth();
   const store = useLocalStore();
   const [query, setQuery] = useState("");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [checklist, setChecklist] = useState<Awaited<ReturnType<typeof fetchStudentChecklist>> | null>(null);
+  const [requestingType, setRequestingType] = useState<string | null>(null);
+  const [requestingAll, setRequestingAll] = useState(false);
+  const [requestNotice, setRequestNotice] = useState("");
 
   const students = useMemo(() => {
     const seen = new Set<string>();
@@ -89,12 +97,45 @@ export default function MyStudents() {
   useEffect(() => {
     if (!selected) {
       setChecklist(null);
+      setRequestNotice("");
       return;
     }
     void fetchStudentChecklist(selected.user_id || selected.id)
       .then(setChecklist)
       .catch(() => setChecklist(null));
   }, [selected?.id, selected?.user_id]);
+
+  const refreshChecklist = async () => {
+    if (!selected) return;
+    const next = await fetchStudentChecklist(selected.user_id || selected.id);
+    setChecklist(next);
+  };
+
+  const sendDocumentRequest = async (documentTypes: string[], mode: "single" | "all" = "single") => {
+    if (!selected || documentTypes.length === 0) return;
+    if (mode === "all") setRequestingAll(true);
+    else setRequestingType(documentTypes[0]);
+    setRequestNotice("");
+    try {
+      const result = await requestStudentDocuments(selected.user_id || selected.id, documentTypes);
+      const count = result.requests.length;
+      setRequestNotice(
+        count === 1
+          ? `Request sent for ${result.requests[0].document_type}.`
+          : `Requests sent for ${count} documents.`,
+      );
+      await refreshChecklist();
+    } catch (error) {
+      setRequestNotice(error instanceof Error ? error.message : "Could not send document request.");
+    } finally {
+      setRequestingType(null);
+      setRequestingAll(false);
+    }
+  };
+
+  const pendingRequestItems = checklist?.items.filter((item) => canRequestDocument(item.status)) || [];
+  const unsentRequestItems = pendingRequestItems.filter((item) => !item.request_sent);
+  const reminderRequestItems = pendingRequestItems.filter((item) => item.request_sent);
 
   return (
     <div>
@@ -125,7 +166,13 @@ export default function MyStudents() {
                     {initials(student.first_name, student.last_name, student.email)}
                   </div>
                   <div className="min-w-0">
-                    <p className="text-lg font-semibold">{displayName(student.first_name, student.last_name, student.email)}</p>
+                    <button
+                      type="button"
+                      className="text-left text-lg font-semibold text-slate-900 transition hover:text-sky-700 hover:underline"
+                      onClick={() => setSelectedId(student.id)}
+                    >
+                      {displayName(student.first_name, student.last_name, student.email)}
+                    </button>
                     <div className="mt-1 flex flex-wrap gap-3 text-sm text-slate-500">
                       <span className="flex items-center gap-1"><Mail className="h-3 w-3" />{student.email || "No email"}</span>
                       <span className="flex items-center gap-1"><Phone className="h-3 w-3" />{student.phone || "No phone"}</span>
@@ -254,28 +301,77 @@ export default function MyStudents() {
                     <ClipboardList className="h-4 w-4 text-sky-500" />
                     <p className="text-sm font-semibold">Document checklist</p>
                   </div>
-                  <Badge
-                    value={checklist.complete ? "approved" : checklist.required_approved > 0 ? "uploaded" : "requested"}
-                    className="normal-case"
-                  >
-                    {checklist.required_approved} of {checklist.required_total} required approved
-                  </Badge>
+                  <div className="flex flex-wrap items-center gap-2">
+                    {unsentRequestItems.length > 0 && (
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        disabled={requestingAll || Boolean(requestingType)}
+                        onClick={() => void sendDocumentRequest(unsentRequestItems.map((item) => item.document_type), "all")}
+                      >
+                        <Send className="h-3.5 w-3.5" />
+                        {requestingAll ? "Sending..." : `Request all missing (${unsentRequestItems.length})`}
+                      </Button>
+                    )}
+                    {unsentRequestItems.length === 0 && reminderRequestItems.length > 0 && (
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        disabled={requestingAll || Boolean(requestingType)}
+                        onClick={() => void sendDocumentRequest(reminderRequestItems.map((item) => item.document_type), "all")}
+                      >
+                        <Send className="h-3.5 w-3.5" />
+                        {requestingAll ? "Sending..." : "Send reminder"}
+                      </Button>
+                    )}
+                    <Badge
+                      value={checklist.complete ? "approved" : checklist.required_approved > 0 ? "uploaded" : "requested"}
+                      className="normal-case"
+                    >
+                      {checklist.required_approved} of {checklist.required_total} required approved
+                    </Badge>
+                  </div>
                 </div>
                 <p className="mb-2 text-xs text-slate-500">
                   Based on {checklist.countries.join(", ") || "no preferred country yet"}
                   {checklist.degree ? ` · ${checklist.degree}` : ""}
                 </p>
+                {requestNotice && (
+                  <p className="mb-2 rounded-xl bg-sky-50 px-3 py-2 text-xs text-sky-800">{requestNotice}</p>
+                )}
                 <div className="space-y-2">
-                  {checklist.items.map((item) => (
-                    <div key={item.document_type} className="flex items-start justify-between gap-3 rounded-xl bg-slate-50 px-3 py-2 text-sm">
-                      <div>
-                        <p className="font-medium">{item.document_type}</p>
-                        {item.description ? <p className="text-slate-500">{item.description}</p> : null}
-                        {item.file_name ? <p className="text-xs text-slate-400">{item.file_name}</p> : null}
+                  {checklist.items.map((item) => {
+                    const showRequest = canRequestDocument(item.status);
+                    const busy = requestingType === item.document_type;
+                    return (
+                      <div key={item.document_type} className="flex items-start justify-between gap-3 rounded-xl bg-slate-50 px-3 py-2 text-sm">
+                        <div className="min-w-0 flex-1">
+                          <p className="font-medium">{item.document_type}</p>
+                          {item.description ? <p className="text-slate-500">{item.description}</p> : null}
+                          {item.file_name ? <p className="text-xs text-slate-400">{item.file_name}</p> : null}
+                          {item.request_sent && item.request_sent_at ? (
+                            <p className="mt-1 text-xs text-sky-700">
+                              Request sent {joinedOn(item.request_sent_at)}
+                            </p>
+                          ) : null}
+                        </div>
+                        <div className="flex shrink-0 flex-col items-end gap-2">
+                          <Badge value={item.status === "approved" ? "approved" : item.status === "rejected" ? "rejected" : item.status === "requested" ? "requested" : "uploaded"} />
+                          {showRequest && (
+                            <Button
+                              size="sm"
+                              variant="secondary"
+                              disabled={busy || requestingAll}
+                              onClick={() => void sendDocumentRequest([item.document_type])}
+                            >
+                              <Send className="h-3.5 w-3.5" />
+                              {busy ? "Sending..." : item.request_sent ? "Send reminder" : "Send request"}
+                            </Button>
+                          )}
+                        </div>
                       </div>
-                      <Badge value={item.status === "approved" ? "approved" : item.status === "rejected" ? "rejected" : item.status === "requested" ? "requested" : "uploaded"} />
-                    </div>
-                  ))}
+                    );
+                  })}
                   {checklist.items.length === 0 && (
                     <p className="text-sm text-slate-500">
                       No checklist items match this student yet. Ask an admin to add document types under Catalog → Document lists.

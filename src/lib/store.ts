@@ -251,12 +251,22 @@ export async function fetchStudentChecklist(studentId: string) {
       document_id: string | null;
       file_name: string | null;
       admin_comments: string;
+      request_id: string | null;
+      request_sent: boolean;
+      request_sent_at: string | null;
     }>;
     required_total: number;
     required_approved: number;
     not_uploaded: number;
     complete: boolean;
   }>(`/students/${studentId}/checklist`);
+}
+
+export async function requestStudentDocuments(studentId: string, documentTypes: string[]) {
+  return api<{ ok: boolean; requests: Array<{ id: string; document_type: string }>; skipped?: Array<{ document_type: string; reason: string }> }>(
+    `/students/${studentId}/document-requests`,
+    { method: "POST", body: { document_types: documentTypes } },
+  );
 }
 
 export async function addShortlist(row: Omit<LocalShortlist, "id" | "created_at">) {
