@@ -27,7 +27,9 @@ interface AuthValue {
     firstName: string;
     lastName: string;
     phone?: string;
+    verificationCode: string;
   }) => Promise<SignUpResult>;
+  sendVerificationCode: (email: string) => Promise<{ message: string; devHint?: string }>;
   updateProfile: (input: {
     firstName: string;
     lastName: string;
@@ -89,6 +91,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       },
       signUp: async (input) => {
         if (input.password.length < 6) throw new Error("Password must be at least 6 characters");
+        if (!input.verificationCode.trim()) throw new Error("Enter the verification code sent to your email");
         const data = await api<{ token: string; user: AppUser }>("/auth/signup", {
           method: "POST",
           auth: false,
@@ -98,6 +101,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         enter(data.user);
         await refreshStore();
         return { ok: true };
+      },
+      sendVerificationCode: async (email) => {
+        const data = await api<{ message: string; devHint?: string }>("/auth/send-verification-code", {
+          method: "POST",
+          auth: false,
+          body: { email },
+        });
+        return { message: data.message, devHint: data.devHint };
       },
       updateProfile: async (input) => {
         if (!user) return;

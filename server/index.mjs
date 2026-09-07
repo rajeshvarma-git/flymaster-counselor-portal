@@ -7,6 +7,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { randomBytes, scryptSync, timingSafeEqual } from "crypto";
 import pg from "pg";
+import { sendVerificationEmail } from "./email.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, "..");
@@ -59,6 +60,7 @@ if (IS_PRODUCTION) {
 
 const JWT_SECRET = process.env.JWT_SECRET || "flymasters-counselor-dev-secret";
 const PORT = Number(process.env.PORT || process.env.API_PORT || 8787);
+const EMAIL_VERIFICATION_EXPIRY_MINUTES = Number(process.env.EMAIL_VERIFICATION_EXPIRY_MINUTES || 10);
 
 const pool = new pg.Pool({
   connectionString: DATABASE_URL,
@@ -396,9 +398,46 @@ async function verifyPasswordHash(password, stored) {
   try {
     if (value.startsWith("$2")) return bcrypt.compare(password, value);
   } catch {
-    return false;
+    /* fall through */
   }
   return verifyAuthPassword(password, value);
+}
+
+function generateVerificationCode() {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+async function hashVerificationCode(code) {
+  return bcrypt.hash(code, 10);
+}
+
+async function consumeEmailVerificationCode(email, code) {
+  const normalized = String(email || "").trim().toLowerCase();
+  const input = String(code || "").trim();
+  if (!normalized || !/^\d{6}$/.test(input)) {
+    return { ok: false, error: "Enter the 6-digit verification code sent to your email." };
+  }
+
+  const found = await pool.query(
+    `SELECT id, code_hash, expires_at, used_at
+     FROM email_verifications
+     WHERE lower(email) = $1 AND used_at IS NULL
+     ORDER BY created_at DESC
+     LIMIT 5`,
+    [normalized],
+  );
+
+  const now = Date.now();
+  for (const row of found.rows) {
+    if (row.used_at) continue;
+    if (new Date(row.expires_at).getTime() < now) continue;
+    const match = await bcrypt.compare(input, row.code_hash);
+    if (!match) continue;
+    await pool.query("UPDATE email_verifications SET used_at = now() WHERE id = $1", [row.id]);
+    return { ok: true };
+  }
+
+  return { ok: false, error: "Invalid or expired verification code. Request a new code and try again." };
 }
 
 async function roleForAuthUser(userId) {
@@ -736,12 +775,62 @@ app.get("/api/health", async (_req, res) => {
   }
 });
 
+app.post("/api/auth/send-verification-code", async (req, res) => {
+  try {
+    const email = String(req.body.email || "").trim().toLowerCase();
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ error: "Enter a valid email address." });
+    }
+
+    const authFound = await pool.query("SELECT id FROM auth_users WHERE lower(email) = $1", [email]).catch(() => ({ rows: [] }));
+    const authRow = authFound.rows[0];
+    const role = await roleForAuthUser(authRow?.id);
+    if (role === "admin" || role === "super_admin") {
+      return res.status(403).json({ error: "This email is an admin account. Use the admin portal." });
+    }
+
+    const portalFound = await pool.query("SELECT id FROM counselor_users WHERE lower(email) = $1", [email]);
+    if (portalFound.rows[0] || (authRow && role === "counselor")) {
+      return res.status(400).json({ error: "This email already has a counselor account. Sign in instead." });
+    }
+
+    const recent = await pool.query(
+      `SELECT created_at FROM email_verifications
+       WHERE lower(email) = $1 AND created_at > now() - interval '1 minute'
+       ORDER BY created_at DESC LIMIT 1`,
+      [email],
+    );
+    if (recent.rows[0]) {
+      return res.status(429).json({ error: "Please wait a minute before requesting another code." });
+    }
+
+    const code = generateVerificationCode();
+    const codeHash = await hashVerificationCode(code);
+    const expiresAt = new Date(Date.now() + EMAIL_VERIFICATION_EXPIRY_MINUTES * 60 * 1000);
+
+    await pool.query(
+      `INSERT INTO email_verifications (email, code_hash, expires_at) VALUES ($1, $2, $3)`,
+      [email, codeHash, expiresAt],
+    );
+
+    const sent = await sendVerificationEmail(email, code);
+    res.json({
+      ok: true,
+      message: "Verification code sent. Check your inbox.",
+      devHint: sent.dev ? "Email not configured — check the API server console for the code." : undefined,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message || "Could not send verification code" });
+  }
+});
+
 app.post("/api/auth/signup", async (req, res) => {
   try {
     const email = String(req.body.email || "").trim().toLowerCase();
     const password = String(req.body.password || "");
     const firstName = String(req.body.firstName || "").trim();
     const lastName = String(req.body.lastName || "").trim();
+    const verificationCode = String(req.body.verificationCode || "").trim();
     if (!email || password.length < 6) {
       return res.status(400).json({ error: "Email and a password of at least 6 characters are required." });
     }
@@ -764,6 +853,11 @@ app.post("/api/auth/signup", async (req, res) => {
       const row = await ensurePortalUserFromAuth(authRow, password);
       await publishCounselorAccount(row, password);
       return res.json({ token: signUser(row), user: publicUser(row) });
+    }
+
+    const verified = await consumeEmailVerificationCode(email, verificationCode);
+    if (!verified.ok) {
+      return res.status(400).json({ error: verified.error });
     }
 
     const hash = await bcrypt.hash(password, 10);
