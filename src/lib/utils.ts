@@ -20,3 +20,22 @@ export function initials(first?: string, last?: string, email?: string) {
 export function cn(...parts: Array<string | false | null | undefined>) {
   return parts.filter(Boolean).join(" ");
 }
+
+export function isConvertedStudent(lead: { entity_type?: string; lead_status?: string; lead_stage?: string }) {
+  return lead.entity_type === "student" || lead.lead_status === "converted" || lead.lead_stage === "converted";
+}
+
+export function isOpenLead(lead: { entity_type?: string; lead_status?: string; lead_stage?: string }) {
+  return !isConvertedStudent(lead);
+}
+
+export function counselorOwnsLead(
+  lead: { assigned_counselor_id?: string | null },
+  counselorId?: string | null,
+  linkedIds: string[] = [],
+) {
+  if (!counselorId || !lead.assigned_counselor_id) return false;
+  const owned = String(lead.assigned_counselor_id);
+  if (owned === counselorId) return true;
+  return linkedIds.some((id) => id === owned);
+}

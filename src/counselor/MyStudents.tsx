@@ -16,21 +16,11 @@ import {
 } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
 import { ensureConversation, fetchStudentChecklist, requestStudentDocuments, useLocalStore } from "@/lib/store";
-import { displayName, initials } from "@/lib/utils";
+import { displayName, initials, isConvertedStudent } from "@/lib/utils";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { Card } from "@/components/ui/Card";
 import { Input } from "@/components/ui/Field";
-
-function isManagedStudent(lead: { entity_type: string; lead_status: string; lead_stage: string; lead_source?: string }) {
-  return (
-    lead.entity_type === "student" ||
-    lead.lead_status === "converted" ||
-    lead.lead_stage === "converted" ||
-    lead.lead_source === "student_site" ||
-    lead.lead_source === "student_chat"
-  );
-}
 
 function joinedOn(value?: string) {
   if (!value) return "—";
@@ -56,7 +46,7 @@ export default function MyStudents() {
   const students = useMemo(() => {
     const seen = new Set<string>();
     return store.leads.filter((lead) => {
-      if (lead.assigned_counselor_id !== user?.id || !isManagedStudent(lead)) return false;
+      if (lead.assigned_counselor_id !== user?.id || !isConvertedStudent(lead)) return false;
       const key = lead.user_id
         ? `u:${lead.user_id}`
         : `e:${(lead.email || "").trim().toLowerCase()}`;

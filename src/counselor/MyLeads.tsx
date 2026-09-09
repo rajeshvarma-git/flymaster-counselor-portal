@@ -1,15 +1,16 @@
 import { useMemo, useState } from "react";
 import { format } from "date-fns";
-import { Flame, Mail, Phone, PhoneCall } from "lucide-react";
+import { Flame, Mail, Phone, PhoneCall, UserCheck } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
 import { claimLead, updateLead, useLocalStore } from "@/lib/store";
 import type { LeadStatus } from "@/lib/types";
+import { isOpenLead } from "@/lib/utils";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { Card } from "@/components/ui/Card";
 import { Input, Label, Select, Textarea } from "@/components/ui/Field";
 
-const STATUSES: LeadStatus[] = ["cold", "warm", "hot", "converted"];
+const STATUSES: LeadStatus[] = ["cold", "warm", "hot"];
 
 export default function MyLeads() {
   const { user } = useAuth();
@@ -22,11 +23,7 @@ export default function MyLeads() {
   const leads = useMemo(
     () =>
       store.leads.filter(
-        (lead) =>
-          lead.assigned_counselor_id === user?.id &&
-          lead.entity_type !== "student" &&
-          lead.lead_status !== "converted" &&
-          lead.lead_stage !== "converted",
+        (lead) => lead.assigned_counselor_id === user?.id && isOpenLead(lead),
       ),
     [store.leads, user?.id],
   );
@@ -45,10 +42,22 @@ export default function MyLeads() {
       last_contact_date: new Date().toISOString(),
       next_follow_up_date: follow || null,
       notes: `${selected.notes || ""}${stamp}`.trim(),
-      conversion_date: status === "converted" ? new Date().toISOString() : selected.conversion_date,
-      entity_type: status === "converted" ? "student" : selected.entity_type,
     });
     setSelectedId(null);
+  };
+
+  const convertToStudent = (leadId: string) => {
+    const lead = leads.find((row) => row.id === leadId);
+    if (!lead) return;
+    const stamp = `\n[${format(new Date(), "PPP")}] Converted to student by counselor`;
+    updateLead(leadId, {
+      lead_status: "converted",
+      lead_stage: "converted",
+      entity_type: "student",
+      conversion_date: new Date().toISOString(),
+      last_contact_date: new Date().toISOString(),
+      notes: `${lead.notes || ""}${stamp}`.trim(),
+    });
   };
 
   return (
@@ -97,6 +106,9 @@ export default function MyLeads() {
                   setStatus((lead.lead_status as LeadStatus) || "cold");
                   setFollow(lead.next_follow_up_date?.slice(0, 10) || "");
                 }}>Update status</Button>
+                <Button size="sm" variant="secondary" onClick={() => convertToStudent(lead.id)}>
+                  <UserCheck className="h-4 w-4" /> Convert to student
+                </Button>
               </div>
             </div>
             {lead.notes && <pre className="mt-3 whitespace-pre-wrap rounded-xl bg-slate-50 p-3 text-xs text-slate-600">{lead.notes}</pre>}

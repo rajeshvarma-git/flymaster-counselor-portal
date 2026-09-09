@@ -167,6 +167,11 @@ function emailLocalKey(value) {
   return String(value || "").trim().toLowerCase().split("@")[0].replace(/[^a-z0-9]/g, "");
 }
 
+function isLeadConverted(row) {
+  if (!row) return false;
+  return row.lead_status === "converted" || row.lead_stage === "converted";
+}
+
 function pickPortalUserId(current, row) {
   if (isPortalStudent(row) && row.user_id) return String(row.user_id);
   if (isPortalStudent(current) && current.user_id) return String(current.user_id);
@@ -188,24 +193,29 @@ function mergeStudents(...lists) {
       || (email && byEmail.get(email))
       || (key.length >= 4 && byEmailKey.get(key))
       || null;
+    const converted = isLeadConverted(row) || isLeadConverted(current);
+    const convertedRow = isLeadConverted(current) ? current : isLeadConverted(row) ? row : null;
     const merged = current
       ? {
-          ...current,
           ...row,
+          ...current,
           id: current.id || row.id,
           user_id: pickPortalUserId(current, row),
-          first_name: row.first_name || current.first_name,
-          last_name: row.last_name || current.last_name,
-          email: row.email || current.email,
-          phone: row.phone || current.phone,
-          preferred_countries: (Array.isArray(row.preferred_countries) && row.preferred_countries.length)
-            ? row.preferred_countries
-            : (current.preferred_countries || []),
-          assigned_counselor_id: row.assigned_counselor_id || current.assigned_counselor_id,
-          entity_type: row.entity_type === "student" || current.entity_type === "student" ? "student" : (row.entity_type || current.entity_type),
+          first_name: current.first_name || row.first_name,
+          last_name: current.last_name || row.last_name,
+          email: current.email || row.email,
+          phone: current.phone || row.phone,
+          preferred_countries: (Array.isArray(current.preferred_countries) && current.preferred_countries.length)
+            ? current.preferred_countries
+            : (Array.isArray(row.preferred_countries) && row.preferred_countries.length ? row.preferred_countries : []),
+          assigned_counselor_id: current.assigned_counselor_id || row.assigned_counselor_id,
+          entity_type: converted || current.entity_type === "student" || row.entity_type === "student" ? "student" : "lead",
+          lead_status: converted ? "converted" : (current.lead_status || row.lead_status),
+          lead_stage: converted ? "converted" : (current.lead_stage || row.lead_stage),
+          conversion_date: convertedRow?.conversion_date || current.conversion_date || row.conversion_date,
           lead_source: current.lead_source === "student_site" || row.lead_source === "student_site"
             ? "student_site"
-            : (row.lead_source || current.lead_source),
+            : (current.lead_source || row.lead_source),
           created_at: current.created_at || row.created_at,
         }
       : row;
@@ -241,13 +251,47 @@ function remapSharedCounselorId(value, counselorId) {
   return String(value) === SHARED_STUDENT_COUNSELOR_ID ? counselorId : value;
 }
 
+const SELF_SERVE_SOURCES = ["student_site", "student_chat"];
+
 function isPortalStudent(row) {
   const source = String(row.lead_source || "");
-  return source === "student_site" || source === "student_chat";
+  return SELF_SERVE_SOURCES.includes(source);
 }
 
-function asLead(row, counselorId) {
-  const portal = isPortalStudent(row) || row.entity_type === "student";
+async function resolveCounselorAliases(portalCounselorId) {
+  const aliases = new Set([String(portalCounselorId)]);
+  const found = await pool.query("SELECT id, email FROM counselor_users WHERE id = $1", [portalCounselorId]).catch(() => ({ rows: [] }));
+  const email = String(found.rows[0]?.email || "").trim().toLowerCase();
+  if (email) {
+    const auth = await pool.query("SELECT id FROM auth_users WHERE lower(email) = $1", [email]).catch(() => ({ rows: [] }));
+    if (auth.rows[0]?.id) aliases.add(String(auth.rows[0].id));
+    const roles = await jsonTable("user_roles").catch(() => []);
+    for (const role of roles.filter((row) => row.role === "counselor")) {
+      const authRow = auth.rows.find((item) => String(item.id) === String(role.user_id));
+      if (authRow && String(authRow.email || "").trim().toLowerCase() === email) {
+        aliases.add(String(role.user_id));
+      }
+    }
+    const counselors = await jsonTable("counselors").catch(() => []);
+    for (const row of counselors) {
+      const authMatch = auth.rows.some((item) => String(item.id) === String(row.user_id));
+      if (authMatch) aliases.add(String(row.user_id));
+    }
+  }
+  return aliases;
+}
+
+function normalizeAssignedCounselorId(assignedId, portalCounselorId, aliases) {
+  const mapped = remapSharedCounselorId(assignedId, portalCounselorId);
+  if (!mapped || !portalCounselorId) return mapped;
+  return aliases.has(String(mapped)) ? String(portalCounselorId) : mapped;
+}
+
+function asLead(row, counselorId, counselorAliases = null) {
+  const selfServe = isPortalStudent(row);
+  const converted = isLeadConverted(row);
+  const openStatus = selfServe ? "hot" : "warm";
+  const aliases = counselorAliases || new Set([String(counselorId || "")]);
   return {
     ...row,
     id: String(row.id),
@@ -259,10 +303,10 @@ function asLead(row, counselorId) {
     field_of_interest: row.field_of_interest || "",
     academic_score: row.academic_score || "",
     preferred_countries: Array.isArray(row.preferred_countries) ? row.preferred_countries : [],
-    assigned_counselor_id: remapSharedCounselorId(row.assigned_counselor_id, counselorId),
-    entity_type: portal ? "student" : (row.entity_type || "lead"),
-    lead_status: row.lead_status || (portal ? "converted" : "warm"),
-    lead_stage: row.lead_stage || (portal ? "converted" : row.lead_status || "warm"),
+    assigned_counselor_id: normalizeAssignedCounselorId(row.assigned_counselor_id, counselorId, aliases),
+    entity_type: converted || row.entity_type === "student" ? "student" : "lead",
+    lead_status: row.lead_status || (converted ? "converted" : openStatus),
+    lead_stage: row.lead_stage || row.lead_status || (converted ? "converted" : openStatus),
   };
 }
 
@@ -724,6 +768,7 @@ async function loadSharedChat(counselorId) {
   const addStudent = (person, source, createdAt) => {
     if (!person?.user_id) return;
     if (leads.some((lead) => String(lead.user_id) === person.user_id)) return;
+    if (leads.some((lead) => emailsMatch(lead.email, person.email))) return;
     leads.push(asLead({
       id: person.id || person.user_id,
       user_id: person.user_id,
@@ -734,7 +779,7 @@ async function loadSharedChat(counselorId) {
       assigned_counselor_id: SHARED_STUDENT_COUNSELOR_ID,
       lead_source: source,
       status: "assigned",
-      entity_type: "student",
+      entity_type: "lead",
       created_at: createdAt || new Date().toISOString(),
     }, counselorId));
   };
@@ -982,6 +1027,7 @@ app.put("/api/profile", auth, async (req, res) => {
 
 app.get("/api/state", auth, async (req, res) => {
   const id = req.user.id;
+  const counselorAliases = await resolveCounselorAliases(id);
   await syncCounselorNameToStudentChat(id).catch(() => {});
   const shared = await loadSharedChat(id).catch(() => ({ leads: [], conversations: [], messages: [], documents: [], shortlists: [], notifications: [], applications: [] }));
   const [leads, conversations, messages, notifications, documents, shortlists, leave, attendance, salary, extras] = await Promise.all([
@@ -1030,8 +1076,8 @@ app.get("/api/state", auth, async (req, res) => {
   }));
   res.json({
     leads: mergeStudents(
-      leads.rows.map((row) => asLead(row, id)),
-      shared.leads,
+      leads.rows.map((row) => asLead(row, id, counselorAliases)),
+      (shared.leads || []).map((row) => asLead(row, id, counselorAliases)),
     ),
     conversations: sortByCreated(mergeById(
       conversations.rows.map((row) => asConversation(row, id)),
@@ -1109,16 +1155,37 @@ app.patch("/api/leads/:id", auth, async (req, res) => {
     "lead_status", "lead_stage", "notes", "next_follow_up_date", "last_contact_date",
     "conversion_date", "entity_type", "assigned_counselor_id", "status",
   ];
-  const entries = Object.entries(req.body).filter(([key]) => allowed.includes(key));
-  if (!entries.length) return res.json({ ok: true });
-  const sets = entries.map(([key], index) => `${key} = $${index + 2}`);
-  const values = entries.map(([, value]) => value);
-  await pool.query(`UPDATE student_leads SET ${sets.join(", ")} WHERE id = $1`, [req.params.id, ...values]);
-  const jsonLeads = await jsonTable("student_leads").catch(() => []);
-  const sharedLead = jsonLeads.find((row) => String(row.id) === String(req.params.id));
-  if (sharedLead) {
-    await jsonUpsert("student_leads", { ...sharedLead, ...Object.fromEntries(entries) });
+  const patch = Object.fromEntries(Object.entries(req.body).filter(([key]) => allowed.includes(key)));
+  if (!Object.keys(patch).length) return res.json({ ok: true });
+
+  const counselorAliases = await resolveCounselorAliases(req.user.id);
+  const [sqlLeads, jsonLeads] = await Promise.all([
+    pool.query("SELECT * FROM student_leads WHERE id::text = $1", [req.params.id]).catch(() => ({ rows: [] })),
+    jsonTable("student_leads").catch(() => []),
+  ]);
+  const current = jsonLeads.find((row) => String(row.id) === String(req.params.id)) || sqlLeads.rows[0];
+  if (!current) return res.status(404).json({ error: "Lead not found." });
+
+  const owned = counselorAliases.has(String(current.assigned_counselor_id || ""));
+  if (!owned) return res.status(403).json({ error: "This lead is not assigned to you." });
+
+  const converting = patch.lead_status === "converted" || patch.entity_type === "student"
+    || patch.lead_stage === "converted";
+  if (converting) {
+    const stamp = new Date().toISOString();
+    patch.entity_type = "student";
+    patch.lead_status = "converted";
+    patch.lead_stage = "converted";
+    patch.conversion_date = patch.conversion_date || stamp;
+    patch.last_contact_date = patch.last_contact_date || stamp;
+    patch.assigned_counselor_id = req.user.id;
+    patch.status = "assigned";
   }
+
+  const sets = Object.keys(patch).map((key, index) => `${key} = $${index + 2}`);
+  const values = Object.values(patch);
+  await pool.query(`UPDATE student_leads SET ${sets.join(", ")} WHERE id = $1`, [req.params.id, ...values]).catch(() => {});
+  await jsonUpsert("student_leads", { ...current, ...patch, id: current.id || req.params.id });
   res.json({ ok: true });
 });
 
@@ -1616,13 +1683,14 @@ function checklistApplies(item, countries, degree) {
 async function counselorOwnsStudent(counselorId, studentRef) {
   const ref = String(studentRef || "");
   if (!ref) return false;
+  const counselorAliases = await resolveCounselorAliases(counselorId);
   const [sqlLeads, jsonLeads] = await Promise.all([
     pool.query("SELECT * FROM student_leads").catch(() => ({ rows: [] })),
     jsonTable("student_leads").catch(() => []),
   ]);
   const leads = mergeStudents(
-    sqlLeads.rows.map((row) => asLead(row, counselorId)),
-    jsonLeads,
+    sqlLeads.rows.map((row) => asLead(row, counselorId, counselorAliases)),
+    jsonLeads.map((row) => asLead(row, counselorId, counselorAliases)),
   );
   return leads.some(
     (lead) =>

@@ -4,6 +4,7 @@ import { Flame, LogIn, LogOut, Phone, Target, Timer, TrendingUp, Users } from "l
 import { format } from "date-fns";
 import { useAuth } from "@/context/AuthContext";
 import { addAttendance, updateAttendance, useLocalStore } from "@/lib/store";
+import { isConvertedStudent, isOpenLead } from "@/lib/utils";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { Card } from "@/components/ui/Card";
@@ -65,8 +66,8 @@ export default function CounselorHome() {
     setBusy(false);
   };
 
-  const students = leads.filter((lead) => lead.entity_type === "student" || lead.lead_status === "converted" || lead.lead_stage === "converted");
-  const openLeads = leads.filter((lead) => lead.entity_type !== "student" && lead.lead_status !== "converted" && lead.lead_stage !== "converted");
+  const students = leads.filter((lead) => isConvertedStudent(lead));
+  const openLeads = leads.filter((lead) => isOpenLead(lead));
   const hot = openLeads.filter((lead) => lead.lead_status === "hot");
   const followUps = openLeads.filter((lead) => lead.next_follow_up_date?.slice(0, 10) === today);
   const rate = leads.length ? Math.round((students.length / leads.length) * 100) : 0;
