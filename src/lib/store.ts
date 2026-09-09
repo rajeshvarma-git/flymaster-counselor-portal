@@ -39,6 +39,7 @@ export interface LocalMessage {
   message: string;
   is_read: boolean;
   created_at: string;
+  updated_at?: string;
 }
 
 export interface LocalNotification {
@@ -311,6 +312,14 @@ export async function sendLocalMessage(input: {
       receiverId: input.receiverId,
       message: input.message,
     },
+  });
+  await refreshStore();
+}
+
+export async function editLocalMessage(messageId: string, message: string) {
+  await api(`/messages/${messageId}`, {
+    method: "PATCH",
+    body: { message },
   });
   await refreshStore();
 }

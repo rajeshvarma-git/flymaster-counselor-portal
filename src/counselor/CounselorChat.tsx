@@ -1,9 +1,15 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { format } from "date-fns";
-import { Clock } from "lucide-react";
+import { Check, Clock, Pencil, X } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
-import { ensureConversation, markConversationRead, sendLocalMessage, useLocalStore } from "@/lib/store";
+import {
+  editLocalMessage,
+  ensureConversation,
+  markConversationRead,
+  sendLocalMessage,
+  useLocalStore,
+} from "@/lib/store";
 import { displayName } from "@/lib/utils";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Field";
@@ -15,6 +21,11 @@ function messageTime(value?: string) {
   return format(date, "HH:mm");
 }
 
+function isEdited(message: { created_at?: string; updated_at?: string }) {
+  if (!message.updated_at || !message.created_at) return false;
+  return new Date(message.updated_at).getTime() > new Date(message.created_at).getTime() + 1000;
+}
+
 export default function CounselorChat() {
   const { user } = useAuth();
   const store = useLocalStore();
@@ -22,6 +33,10 @@ export default function CounselorChat() {
   const wantedStudent = params.get("student") || "";
   const [activeId, setActiveId] = useState("");
   const [draft, setDraft] = useState("");
+  const [editingId, setEditingId] = useState("");
+  const [editDraft, setEditDraft] = useState("");
+  const [savingEdit, setSavingEdit] = useState(false);
+  const [editError, setEditError] = useState("");
   const bottomRef = useRef<HTMLDivElement>(null);
 
   const mine = store.leads.filter((lead) => lead.assigned_counselor_id === user?.id);
@@ -71,7 +86,7 @@ export default function CounselorChat() {
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages.length]);
+  }, [messages.length, editingId]);
 
   const send = (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
@@ -83,6 +98,44 @@ export default function CounselorChat() {
       message: draft.trim(),
     });
     setDraft("");
+  };
+
+  const startEdit = (messageId: string, text: string) => {
+    setEditingId(messageId);
+    setEditDraft(text);
+    setEditError("");
+  };
+
+  const cancelEdit = () => {
+    setEditingId("");
+    setEditDraft("");
+    setEditError("");
+  };
+
+  const saveEdit = async () => {
+    if (!editingId || !editDraft.trim() || savingEdit) return;
+    try {
+      setSavingEdit(true);
+      setEditError("");
+      await editLocalMessage(editingId, editDraft.trim());
+      cancelEdit();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not save edit. Restart the counselor API and try again.";
+      setEditError(message);
+      console.error("Failed to edit message:", error);
+    } finally {
+      setSavingEdit(false);
+    }
+  };
+
+  const handleEditKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      void saveEdit();
+    }
+    if (e.key === "Escape") {
+      cancelEdit();
+    }
   };
 
   return (
@@ -118,17 +171,59 @@ export default function CounselorChat() {
           <div className="flex-1 space-y-3 overflow-y-auto p-4">
             {messages.map((message) => {
               const mineMsg = message.sender_id === user?.id;
+              const editing = editingId === message.id;
+
               return (
-                <div key={message.id} className={`flex ${mineMsg ? "justify-end" : "justify-start"}`}>
-                  <div className={`max-w-[75%] rounded-2xl px-3 py-2 text-sm ${mineMsg ? "bg-navy-900 text-white" : "bg-slate-100"}`}>
-                    <p>{message.message}</p>
-                    {messageTime(message.created_at) && (
-                      <p className={`mt-1 flex items-center gap-1 text-[10px] ${mineMsg ? "text-white/70" : "text-slate-500"}`}>
-                        <Clock className="h-3 w-3" />
-                        {messageTime(message.created_at)}
-                      </p>
-                    )}
-                  </div>
+                <div key={message.id} className={`group flex ${mineMsg ? "justify-end" : "justify-start"}`}>
+                  {editing ? (
+                    <div className="flex w-full max-w-[75%] flex-col gap-2 rounded-2xl border border-sky-200 bg-sky-50 p-3">
+                      <Input
+                        value={editDraft}
+                        onChange={(e) => setEditDraft(e.target.value)}
+                        onKeyDown={handleEditKeyDown}
+                        disabled={savingEdit}
+                        autoFocus
+                      />
+                      {editError && <p className="text-xs text-rose-600">{editError}</p>}
+                      <div className="flex justify-end gap-2">
+                        <Button type="button" variant="ghost" size="sm" onClick={cancelEdit} disabled={savingEdit}>
+                          <X className="h-3.5 w-3.5" />
+                          Cancel
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          onClick={() => void saveEdit()}
+                          disabled={!editDraft.trim() || savingEdit}
+                        >
+                          <Check className="h-3.5 w-3.5" />
+                          Save
+                        </Button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className={`relative max-w-[75%] rounded-2xl px-3 py-2 text-sm ${mineMsg ? "bg-navy-900 text-white" : "bg-slate-100"}`}>
+                      {mineMsg && (
+                        <button
+                          type="button"
+                          onClick={() => startEdit(message.id, message.message)}
+                          className="absolute -left-8 top-1/2 -translate-y-1/2 rounded-lg p-1 text-slate-400 opacity-0 transition hover:bg-slate-100 hover:text-slate-700 group-hover:opacity-100"
+                          title="Edit message"
+                          aria-label="Edit message"
+                        >
+                          <Pencil className="h-3.5 w-3.5" />
+                        </button>
+                      )}
+                      <p>{message.message}</p>
+                      {messageTime(message.created_at) && (
+                        <p className={`mt-1 flex items-center gap-1 text-[10px] ${mineMsg ? "text-white/70" : "text-slate-500"}`}>
+                          <Clock className="h-3 w-3" />
+                          {messageTime(message.created_at)}
+                          {isEdited(message) && <span className="italic opacity-80">(edited)</span>}
+                        </p>
+                      )}
+                    </div>
+                  )}
                 </div>
               );
             })}

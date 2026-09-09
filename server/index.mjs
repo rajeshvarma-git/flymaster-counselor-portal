@@ -149,7 +149,15 @@ function mergeById(...lists) {
   for (const list of lists) {
     for (const row of list || []) {
       if (row?.id == null) continue;
-      map.set(String(row.id), row);
+      const key = String(row.id);
+      const current = map.get(key);
+      if (!current) {
+        map.set(key, row);
+        continue;
+      }
+      const currentUpdated = Date.parse(String(current.updated_at || current.created_at || "")) || 0;
+      const nextUpdated = Date.parse(String(row.updated_at || row.created_at || "")) || 0;
+      map.set(key, nextUpdated >= currentUpdated ? row : current);
     }
   }
   return [...map.values()];
@@ -1386,6 +1394,48 @@ app.post("/api/messages", auth, async (req, res) => {
   });
 
   res.json(asMessage(row, req.user.id));
+});
+
+app.patch("/api/messages/:id", auth, async (req, res) => {
+  const messageId = String(req.params.id);
+  const text = String(req.body.message || "").trim();
+  if (!text) {
+    return res.status(400).json({ error: "Message text is required." });
+  }
+
+  const jsonMessages = await jsonTable("private_messages");
+  const existing = jsonMessages.find((row) => String(row.id) === messageId);
+  const sqlResult = await pool
+    .query("SELECT * FROM private_messages WHERE id = $1", [messageId])
+    .catch(() => ({ rows: [] }));
+  const sqlRow = sqlResult.rows[0];
+
+  if (!existing && !sqlRow) {
+    return res.status(404).json({ error: "Message not found." });
+  }
+
+  const senderId = existing?.sender_id ?? sqlRow?.sender_id;
+  if (remapSharedCounselorId(senderId, req.user.id) !== req.user.id) {
+    return res.status(403).json({ error: "You can only edit your own messages." });
+  }
+
+  const now = new Date().toISOString();
+  let updated = null;
+
+  if (existing) {
+    updated = { ...existing, message: text, updated_at: now };
+    await jsonUpsert("private_messages", updated);
+  }
+
+  if (sqlRow) {
+    const sqlUpdated = await pool.query(
+      "UPDATE private_messages SET message = $1 WHERE id = $2 RETURNING *",
+      [text, messageId],
+    );
+    updated = updated ? { ...updated, ...sqlUpdated.rows[0] } : { ...sqlRow, message: text, updated_at: now };
+  }
+
+  return res.json(asMessage(updated, req.user.id));
 });
 
 app.post("/api/conversations/:id/read", auth, async (req, res) => {
