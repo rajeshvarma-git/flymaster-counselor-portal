@@ -246,6 +246,111 @@ function sortByCreated(rows) {
   return [...(rows || [])].sort((a, b) => String(a.created_at || "").localeCompare(String(b.created_at || "")));
 }
 
+function sortNotifications(rows) {
+  return [...(rows || [])].sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
+}
+
+function asNotification(row, fallbackUserId = "") {
+  const type = row.type || row.notification_type || "info";
+  const title = String(row.title || "Notification");
+  let actionUrl = row.action_url || "";
+  if (!actionUrl) {
+    const lower = title.toLowerCase();
+    if (type === "chat" || lower.includes("message")) actionUrl = "/counselor/chat";
+    else if (lower.includes("document")) actionUrl = "/counselor/documents";
+    else if (lower.includes("lead")) actionUrl = "/counselor/leads";
+    else if (lower.includes("student")) actionUrl = "/counselor/students";
+  }
+  return {
+    id: String(row.id),
+    user_id: String(row.user_id || fallbackUserId),
+    title,
+    message: row.message || row.body || "",
+    is_read: Boolean(row.is_read),
+    created_at: row.created_at || new Date().toISOString(),
+    type,
+    category: row.category || (type === "chat" ? "chat" : row.notification_type ? "document" : "general"),
+    action_url: actionUrl,
+  };
+}
+
+async function notifyCounselor(userId, title, message, type = "info", actionUrl = "", category = "general") {
+  if (!userId) return;
+  const now = new Date().toISOString();
+  const row = {
+    id: crypto.randomUUID(),
+    user_id: String(userId),
+    title,
+    message,
+    type,
+    category,
+    action_url: actionUrl,
+    created_at: now,
+    is_read: false,
+  };
+  await jsonUpsert("notifications", row);
+  if (isUuid(userId)) {
+    await pool.query(
+      "INSERT INTO notifications (id, user_id, title, message, is_read, created_at) VALUES ($1,$2,$3,$4,false,$5) ON CONFLICT (id) DO NOTHING",
+      [row.id, userId, title, message, now],
+    ).catch(() => {});
+  }
+}
+
+async function syncChatNotifications(counselorId, conversations, messages, leads) {
+  const existing = await jsonTable("notifications").catch(() => []);
+  const seenMessageIds = new Set(
+    existing
+      .filter((row) => String(row.user_id) === String(counselorId) && row.source_message_id)
+      .map((row) => String(row.source_message_id)),
+  );
+
+  for (const msg of messages || []) {
+    if (String(msg.receiver_id) !== String(counselorId)) continue;
+    if (msg.is_read) continue;
+    if (seenMessageIds.has(String(msg.id))) continue;
+
+    const conv = (conversations || []).find((row) => String(row.id) === String(msg.conversation_id));
+    const studentId = conv?.student_id ? String(conv.student_id) : "";
+    const lead = (leads || []).find((row) => String(row.user_id) === studentId);
+    const studentName = [lead?.first_name, lead?.last_name].filter(Boolean).join(" ").trim() || lead?.email || "A student";
+    const preview = String(msg.message || "").trim();
+    const shortPreview = preview.length > 140 ? `${preview.slice(0, 137)}...` : preview;
+    const now = msg.created_at || new Date().toISOString();
+    const notifId = `chat_${msg.id}`;
+
+    await jsonUpsert("notifications", {
+      id: notifId,
+      user_id: String(counselorId),
+      title: `New message from ${studentName}`,
+      message: shortPreview || "Open Student Chat to read the message.",
+      type: "chat",
+      category: "chat",
+      source_message_id: String(msg.id),
+      action_url: studentId ? `/counselor/chat?student=${studentId}` : "/counselor/chat",
+      created_at: now,
+      is_read: false,
+    });
+    if (isUuid(counselorId)) {
+      await pool.query(
+        "INSERT INTO notifications (id, user_id, title, message, is_read, created_at) VALUES ($1,$2,$3,$4,false,$5) ON CONFLICT (id) DO NOTHING",
+        [notifId, counselorId, `New message from ${studentName}`, shortPreview || "Open Student Chat to read the message.", now],
+      ).catch(() => {});
+    }
+    seenMessageIds.add(String(msg.id));
+  }
+}
+
+async function markNotificationReadForUser(userId, notificationId) {
+  await pool.query("UPDATE notifications SET is_read = true WHERE id = $1 AND user_id = $2", [notificationId, userId]).catch(() => {});
+  const notes = await jsonTable("notifications").catch(() => []);
+  const found = notes.find((row) => String(row.id) === String(notificationId));
+  if (found) await jsonUpsert("notifications", { ...found, is_read: true });
+  const docNotes = await jsonTable("document_notifications").catch(() => []);
+  const docFound = docNotes.find((row) => String(row.id) === String(notificationId));
+  if (docFound) await jsonUpsert("document_notifications", { ...docFound, is_read: true });
+}
+
 function remapSharedCounselorId(value, counselorId) {
   if (value == null || value === "") return value;
   return String(value) === SHARED_STUDENT_COUNSELOR_ID ? counselorId : value;
@@ -804,14 +909,13 @@ async function loadSharedChat(counselorId) {
     applications: jsonApplications.map(asApplication),
     notifications: jsonDocNotes
       .filter((row) => remapSharedCounselorId(row.user_id, counselorId) === counselorId)
-      .map((row) => ({
-        id: String(row.id),
+      .map((row) => asNotification({
+        ...row,
         user_id: counselorId,
-        title: row.title || "Document update",
-        message: row.message || "",
-        is_read: Boolean(row.is_read),
-        created_at: row.created_at || new Date().toISOString(),
-      })),
+        type: row.notification_type || "info",
+        category: row.notification_type === "chat" ? "chat" : "document",
+        action_url: row.action_url || (row.notification_type === "chat" ? "/counselor/chat" : "/counselor/documents"),
+      }, counselorId)),
   };
 }
 
@@ -1074,29 +1178,47 @@ app.get("/api/state", auth, async (req, res) => {
       student_email: (known && !emailsMatch(known.email, current?.student_email) ? known.email : null) || lead?.email || current?.student_email || "",
     }).catch(() => null);
   }));
+  const mergedLeads = mergeStudents(
+    leads.rows.map((row) => asLead(row, id, counselorAliases)),
+    (shared.leads || []).map((row) => asLead(row, id, counselorAliases)),
+  );
+  const mergedConversations = sortByCreated(mergeById(
+    conversations.rows.map((row) => asConversation(row, id)),
+    shared.conversations,
+  ));
+  const mergedMessages = sortByCreated((() => {
+    const sqlConversationIds = new Set(conversations.rows.map((row) => String(row.id)));
+    const sqlOnly = messages.rows
+      .filter((row) => sqlConversationIds.has(String(row.conversation_id)))
+      .map((row) => asMessage(row, id));
+    return mergeById(sqlOnly, shared.messages);
+  })());
+
+  await syncChatNotifications(id, mergedConversations, mergedMessages, mergedLeads).catch(() => {});
+
+  const [jsonNotifications, jsonDocNotifications] = await Promise.all([
+    jsonTable("notifications").catch(() => []),
+    jsonTable("document_notifications").catch(() => []),
+  ]);
+
   res.json({
-    leads: mergeStudents(
-      leads.rows.map((row) => asLead(row, id, counselorAliases)),
-      (shared.leads || []).map((row) => asLead(row, id, counselorAliases)),
-    ),
-    conversations: sortByCreated(mergeById(
-      conversations.rows.map((row) => asConversation(row, id)),
-      shared.conversations,
+    leads: mergedLeads,
+    conversations: mergedConversations,
+    messages: mergedMessages,
+    notifications: sortNotifications(mergeById(
+      notifications.rows.map((row) => asNotification(row, id)),
+      jsonNotifications.filter((row) => String(row.user_id) === String(id)).map((row) => asNotification(row, id)),
+      jsonDocNotifications
+        .filter((row) => remapSharedCounselorId(row.user_id, id) === id)
+        .map((row) => asNotification({
+          ...row,
+          user_id: id,
+          type: row.notification_type || "info",
+          category: row.notification_type === "chat" ? "chat" : "document",
+          action_url: row.action_url || (row.notification_type === "chat" ? "/counselor/chat" : "/counselor/documents"),
+        }, id)),
+      (shared.notifications || []).map((row) => asNotification(row, id)),
     )),
-    messages: sortByCreated((() => {
-      const sqlConversationIds = new Set(conversations.rows.map((row) => String(row.id)));
-      const sqlOnly = messages.rows
-        .filter((row) => sqlConversationIds.has(String(row.conversation_id)))
-        .map((row) => asMessage(row, id));
-      return mergeById(sqlOnly, shared.messages);
-    })()),
-    notifications: mergeById(
-      notifications.rows.map((row) => ({
-        ...row,
-        message: row.message || row.body || "",
-      })),
-      shared.notifications,
-    ),
     documents: mergeById(
       documents.rows.map(asDocument),
       shared.documents,
@@ -1373,7 +1495,20 @@ app.patch("/api/applications/:id", auth, async (req, res) => {
 });
 
 app.post("/api/notifications/read", auth, async (req, res) => {
-  await pool.query("UPDATE notifications SET is_read = true WHERE user_id = $1", [req.user.id]);
+  await pool.query("UPDATE notifications SET is_read = true WHERE user_id = $1", [req.user.id]).catch(() => {});
+  const [notes, docNotes] = await Promise.all([
+    jsonTable("notifications").catch(() => []),
+    jsonTable("document_notifications").catch(() => []),
+  ]);
+  await Promise.all([
+    ...notes.filter((row) => String(row.user_id) === String(req.user.id)).map((row) => jsonUpsert("notifications", { ...row, is_read: true })),
+    ...docNotes.filter((row) => remapSharedCounselorId(row.user_id, req.user.id) === String(req.user.id)).map((row) => jsonUpsert("document_notifications", { ...row, is_read: true })),
+  ]);
+  res.json({ ok: true });
+});
+
+app.post("/api/notifications/:id/read", auth, async (req, res) => {
+  await markNotificationReadForUser(req.user.id, req.params.id);
   res.json({ ok: true });
 });
 
@@ -1511,12 +1646,12 @@ app.post("/api/conversations/:id/read", auth, async (req, res) => {
     [req.params.id, req.user.id],
   ).catch(() => {});
   const messages = await jsonTable("private_messages");
-  await Promise.all(
-    messages
-      .filter((row) => String(row.conversation_id) === String(req.params.id))
-      .filter((row) => [req.user.id, SHARED_STUDENT_COUNSELOR_ID].includes(String(row.receiver_id)))
-      .map((row) => jsonUpsert("private_messages", { ...row, is_read: true })),
+  const unreadInThread = messages.filter(
+    (row) => String(row.conversation_id) === String(req.params.id)
+      && [req.user.id, SHARED_STUDENT_COUNSELOR_ID].includes(String(row.receiver_id)),
   );
+  await Promise.all(unreadInThread.map((row) => jsonUpsert("private_messages", { ...row, is_read: true })));
+  await Promise.all(unreadInThread.map((row) => markNotificationReadForUser(req.user.id, `chat_${row.id}`).catch(() => {})));
   res.json({ ok: true });
 });
 

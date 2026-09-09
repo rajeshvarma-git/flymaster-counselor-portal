@@ -1,13 +1,18 @@
 import { FormEvent, useEffect, useState } from "react";
-import { format } from "date-fns";
+import { format, formatDistanceToNow } from "date-fns";
+import { useNavigate } from "react-router-dom";
+import { Bell } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
 import {
   addAttendance,
   addLeave,
+  markNotificationRead,
   markNotificationsRead,
   updateAttendance,
   useLocalStore,
 } from "@/lib/store";
+import type { LocalNotification } from "@/lib/store";
+import { notificationIcon, notificationTone, notificationUrl } from "@/counselor/notificationUtils";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { Card } from "@/components/ui/Card";
@@ -133,21 +138,72 @@ export function CounselorProfile() {
 export function NotificationsPage() {
   const { user } = useAuth();
   const store = useLocalStore();
-  const notes = store.notifications.filter((item) => item.user_id === user?.id);
+  const navigate = useNavigate();
+  const notes = store.notifications
+    .filter((item) => item.user_id === user?.id)
+    .sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
+  const unread = notes.filter((note) => !note.is_read).length;
+
+  const openNote = async (note: LocalNotification) => {
+    if (!note.is_read) await markNotificationRead(note.id).catch(() => {});
+    navigate(notificationUrl(note));
+  };
 
   return (
     <div>
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold">Notifications</h1>
-        <Button size="sm" variant="secondary" onClick={() => user && markNotificationsRead(user.id)}>Mark all read</Button>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-3">
+          <div className="flex h-10 w-10 items-center justify-center rounded-full bg-sky-100 text-sky-600">
+            <Bell className="h-5 w-5" />
+          </div>
+          <div>
+            <h1 className="text-2xl font-bold">Notifications</h1>
+            <p className="text-sm text-slate-500">{unread > 0 ? `${unread} unread` : "You are all caught up"}</p>
+          </div>
+        </div>
+        {notes.length > 0 && (
+          <Button size="sm" variant="secondary" onClick={() => user && markNotificationsRead(user.id)}>
+            Mark all read
+          </Button>
+        )}
       </div>
       <div className="mt-4 space-y-3">
-        {notes.map((note) => (
-          <Card key={note.id} className={`p-4 ${note.is_read ? "" : "border-sky-200 bg-sky-50"}`}>
-            <p className="font-semibold">{note.title}</p>
-            <p className="text-sm text-slate-600">{note.message}</p>
-          </Card>
-        ))}
+        {notes.map((note) => {
+          const Icon = notificationIcon(note);
+          return (
+            <Card
+              key={note.id}
+              className={`cursor-pointer p-4 transition hover:shadow-sm ${note.is_read ? "bg-white" : notificationTone(note)}`}
+              onClick={() => void openNote(note)}
+            >
+              <div className="flex items-start gap-3">
+                <div className="rounded-full bg-white/80 p-2 text-sky-600 shadow-sm">
+                  <Icon className="h-4 w-4" />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-start justify-between gap-3">
+                    <p className="font-semibold text-slate-900">{note.title}</p>
+                    {!note.is_read && <span className="mt-1 h-2 w-2 shrink-0 rounded-full bg-sky-500" />}
+                  </div>
+                  <p className="mt-1 text-sm text-slate-600">{note.message}</p>
+                  <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-500">
+                    <span>
+                      {note.created_at
+                        ? format(new Date(note.created_at), "MMM d, yyyy · h:mm a")
+                        : "Recently"}
+                    </span>
+                    {note.created_at && (
+                      <span>({formatDistanceToNow(new Date(note.created_at), { addSuffix: true })})</span>
+                    )}
+                    {note.category && (
+                      <span className="rounded-full bg-white/80 px-2 py-0.5 capitalize text-slate-600">{note.category}</span>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </Card>
+          );
+        })}
         {notes.length === 0 && <p className="text-slate-500">No notifications.</p>}
       </div>
     </div>

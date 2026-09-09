@@ -22,6 +22,7 @@ import { useAuth } from "@/context/AuthContext";
 import { displayName, initials } from "@/lib/utils";
 import { Button } from "@/components/ui/Button";
 import { useLocalStore } from "@/lib/store";
+import NotificationBell from "@/counselor/NotificationBell";
 
 const work = [
   { to: "/counselor", label: "Dashboard", icon: LayoutDashboard, end: true },
@@ -46,6 +47,7 @@ export default function CounselorLayout() {
   const [open, setOpen] = useState(false);
   const store = useLocalStore();
   const unread = store.notifications.filter((item) => item.user_id === user?.id && !item.is_read).length;
+  const unreadChats = store.messages.filter((item) => item.receiver_id === user?.id && !item.is_read).length;
   const pendingApps = (store.applications || []).filter(
     (item) => item.status === "pending_counselor" || item.status === "submitted",
   ).length;
@@ -79,6 +81,9 @@ export default function CounselorLayout() {
             {item.label}
             {item.label === "Applications" && pendingApps > 0 && (
               <span className="ml-auto rounded-full bg-sky-500 px-1.5 text-[10px] font-bold text-white">{pendingApps}</span>
+            )}
+            {item.label === "Student Chat" && unreadChats > 0 && (
+              <span className="ml-auto rounded-full bg-violet-500 px-1.5 text-[10px] font-bold text-white">{unreadChats}</span>
             )}
             {item.label === "Notifications" && unread > 0 && (
               <span className="ml-auto rounded-full bg-gold-500 px-1.5 text-[10px] font-bold text-navy-950">{unread}</span>
@@ -148,6 +153,9 @@ export default function CounselorLayout() {
         </>
       )}
       <main className="flex-1 overflow-y-auto p-4 pt-14 md:p-8 md:pt-8">
+        <div className="mb-4 flex justify-end md:mb-6">
+          <NotificationBell />
+        </div>
         <Outlet />
       </main>
     </div>

@@ -49,6 +49,9 @@ export interface LocalNotification {
   message: string;
   is_read: boolean;
   created_at: string;
+  type?: string;
+  category?: string;
+  action_url?: string;
 }
 
 export interface LocalDocument {
@@ -221,6 +224,11 @@ export async function saveCounselorExtra(extra: CounselorExtra) {
 
 export async function markNotificationsRead(_userId: string) {
   await api("/notifications/read", { method: "POST" });
+  await refreshStore();
+}
+
+export async function markNotificationRead(notificationId: string) {
+  await api(`/notifications/${notificationId}/read`, { method: "POST" });
   await refreshStore();
 }
 
