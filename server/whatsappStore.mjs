@@ -475,7 +475,7 @@ export async function enrichWhatsAppConversations(pool, conversations, leads, { 
     const convMessages = messages
       .filter((item) => String(item.conversation_id) === String(row.id))
       .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
-    const chatMessages = convMessages.filter((item) => item.channel !== "system" && item.kind !== "system");
+    const chatMessages = convMessages.filter((item) => !isHandoffSystemMessage(item));
     const last = chatMessages[chatMessages.length - 1];
     const unread = chatMessages.filter((item) => item.direction === "inbound" && !item.is_read).length;
     const studentName = lead ? [lead.first_name, lead.last_name].filter(Boolean).join(" ").trim() : "";
@@ -495,44 +495,24 @@ export async function enrichWhatsAppConversations(pool, conversations, leads, { 
   });
 }
 
-export async function appendSystemMessage(pool, conversationId, body) {
-  return appendWhatsAppMessage(pool, {
-    conversationId,
-    direction: "inbound",
-    body,
-    senderId: null,
-    senderType: "system",
-    channel: "system",
-    status: "system",
-  });
+const HANDOFF_NOTICE_RE = /joined this chat|left this chat|handles WhatsApp replies|Waiting for a counselor/i;
+
+export function isHandoffSystemMessage(message) {
+  if (!message) return false;
+  return HANDOFF_NOTICE_RE.test(String(message.body || ""));
 }
 
-export async function recordParticipantHandoff(pool, conversation, previousLead, nextLead) {
+/** Sync assignment metadata only — no in-chat handoff notices. */
+export async function recordParticipantHandoff(pool, conversation, _previousLead, nextLead) {
   if (!conversation?.id || !nextLead) return conversation;
   const nextKey = participantSyncKey(nextLead);
   if (String(conversation.participant_sync_key || "") === nextKey) return conversation;
 
-  const prevTc = String(previousLead?.assigned_telecaller_id || "");
-  const nextTc = String(nextLead.assigned_telecaller_id || "");
-  const prevCo = String(previousLead?.assigned_counselor_id || "");
-  const nextCo = String(nextLead.assigned_counselor_id || "");
-  const wasConverted = isConvertedStudent(previousLead);
-  const isConverted = isConvertedStudent(nextLead);
-
-  const notes = [];
-  if (nextTc && nextTc !== prevTc) notes.push("A telecaller joined this chat.");
-  if (nextCo && nextCo !== prevCo) notes.push("A counselor joined this chat.");
-  if (isConverted && !wasConverted) notes.push("Lead converted — counselor now handles WhatsApp replies.");
-
-  for (const body of notes) {
-    await appendSystemMessage(pool, conversation.id, body);
-  }
-
   const updated = {
     ...conversation,
     participant_sync_key: nextKey,
-    assigned_telecaller_id: nextTc || null,
-    assigned_counselor_id: nextCo || null,
+    assigned_telecaller_id: nextLead.assigned_telecaller_id ? String(nextLead.assigned_telecaller_id) : null,
+    assigned_counselor_id: nextLead.assigned_counselor_id ? String(nextLead.assigned_counselor_id) : null,
   };
   await jsonUpsert(pool, "whatsapp_conversations", updated);
   return updated;
@@ -615,11 +595,12 @@ export async function listWhatsAppMessages(pool, conversationId) {
   const rows = await jsonTable(pool, "whatsapp_messages");
   return rows
     .filter((row) => String(row.conversation_id) === String(conversationId))
+    .filter((row) => !isHandoffSystemMessage(row))
     .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
 }
 
 function isRealInboundMessage(row) {
-  return row.direction === "inbound" && row.channel !== "system" && row.kind !== "system";
+  return row.direction === "inbound" && !isHandoffSystemMessage(row);
 }
 
 export async function getMessagingWindowStatus(pool, conversationId) {

@@ -91,6 +91,10 @@ function isConvertedLead(lead: { entity_type?: string; lead_status?: string }) {
   return lead.entity_type === "student" || lead.lead_status === "converted";
 }
 
+function isHandoffNotice(body: string) {
+  return /joined this chat|left this chat|handles WhatsApp replies|Waiting for a counselor/i.test(body);
+}
+
 interface WhatsAppChatProps {
   mode: WhatsAppPageMode;
 }
@@ -214,15 +218,10 @@ export default function WhatsAppChat({ mode }: WhatsAppChatProps) {
   const unknownCount = conversations.filter((item) => item.is_unknown).length;
   const whatsappReady = status?.credentialsValid && status?.webhookReady;
 
-  const visibleMessages = useMemo(() => {
-    return messages.filter((item, index) => {
-      const system = item.channel === "system" || item.kind === "system";
-      if (!system) return true;
-      const prev = messages[index - 1];
-      if (!prev) return true;
-      return !((prev.channel === "system" || prev.kind === "system") && prev.body === item.body);
-    });
-  }, [messages]);
+  const visibleMessages = useMemo(
+    () => messages.filter((item) => !isHandoffNotice(item.body || "")),
+    [messages],
+  );
 
   return (
     <div>
@@ -348,14 +347,6 @@ export default function WhatsAppChat({ mode }: WhatsAppChatProps) {
               </div>
               <div className="min-h-0 flex-1 overflow-y-auto">
                 {visibleMessages.map((item) => {
-                  const system = item.channel === "system" || item.kind === "system";
-                  if (system) {
-                    return (
-                      <p key={item.id} className="mb-3 text-center text-[11px] text-slate-500">
-                        {item.body}
-                      </p>
-                    );
-                  }
                   const fromContact = item.direction === "inbound";
                   return (
                     <div
