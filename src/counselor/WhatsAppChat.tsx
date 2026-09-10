@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { format } from "date-fns";
 import { AlertCircle, MessageCircle, Phone, Send, Users } from "lucide-react";
+import { useAuth } from "@/context/AuthContext";
 import { api } from "@/lib/api";
 import { useLocalStore } from "@/lib/store";
 import { displayName } from "@/lib/utils";
@@ -43,6 +44,14 @@ interface WhatsAppStatus {
   displayPhone?: string | null;
 }
 
+interface WhatsAppMeta {
+  assigned?: number;
+  withPhone?: number;
+  missingPhone?: number;
+  provisioned?: number;
+  skippedNoPhone?: number;
+}
+
 const PAGE_COPY: Record<
   WhatsAppPageMode,
   { title: string; subtitle: string; emptyTitle: string; emptyHint: string; icon: typeof MessageCircle; accent: string; selectedBg: string; bubbleBg: string }
@@ -51,7 +60,7 @@ const PAGE_COPY: Record<
     title: "WhatsApp — Leads",
     subtitle: "WhatsApp threads for open leads assigned to you (before conversion).",
     emptyTitle: "No lead WhatsApp threads yet.",
-    emptyHint: "When a lead messages your Fly Masters WhatsApp number, their chat appears here.",
+    emptyHint: "Assigned leads with a phone number appear here. When they message your Fly Masters WhatsApp number, you can reply within 24 hours.",
     icon: Phone,
     accent: "text-sky-500",
     selectedBg: "bg-sky-50",
@@ -87,8 +96,10 @@ interface WhatsAppChatProps {
 export default function WhatsAppChat({ mode }: WhatsAppChatProps) {
   const copy = PAGE_COPY[mode];
   const Icon = copy.icon;
+  const { user } = useAuth();
   const store = useLocalStore();
   const [conversations, setConversations] = useState<WhatsAppConversation[]>([]);
+  const [meta, setMeta] = useState<WhatsAppMeta | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [messages, setMessages] = useState<WhatsAppMessage[]>([]);
   const [draft, setDraft] = useState("");
@@ -100,11 +111,13 @@ export default function WhatsAppChat({ mode }: WhatsAppChatProps) {
   const [windowStatus, setWindowStatus] = useState<{ open: boolean; reason?: string } | null>(null);
 
   const assignedCount = useMemo(() => {
+    if (!user?.id) return 0;
     return store.leads.filter((lead) => {
       const converted = isConvertedLead(lead);
-      return mode === "student" ? converted : !converted;
+      const matchesMode = mode === "student" ? converted : !converted;
+      return matchesMode && lead.assigned_counselor_id === user.id;
     }).length;
-  }, [store.leads, mode]);
+  }, [store.leads, mode, user?.id]);
 
   useEffect(() => {
     void api<WhatsAppStatus>("/whatsapp/status", { auth: false })
@@ -117,10 +130,11 @@ export default function WhatsAppChat({ mode }: WhatsAppChatProps) {
     setMessages([]);
     setLoading(true);
     const load = () =>
-      api<{ conversations: WhatsAppConversation[] }>(`/whatsapp/conversations?stage=${mode}`)
+      api<{ conversations: WhatsAppConversation[]; meta?: WhatsAppMeta | null }>(`/whatsapp/conversations?stage=${mode}`)
         .then((data) => {
           const next = data.conversations || [];
           setConversations(next);
+          setMeta(data.meta || null);
           setLoadError(null);
           setSelectedId((current) => {
             if (current && next.some((item) => item.id === current)) return current;
@@ -277,7 +291,16 @@ export default function WhatsAppChat({ mode }: WhatsAppChatProps) {
               {assignedCount > 0 && (
                 <p className="text-xs leading-relaxed text-slate-400">
                   You have {assignedCount} assigned {mode === "lead" ? "lead" : "student"}
-                  {assignedCount === 1 ? "" : "s"} — once they message on WhatsApp, the chat will show here.
+                  {assignedCount === 1 ? "" : "s"}
+                  {(meta?.withPhone ?? assignedCount) > 0
+                    ? " with a phone number — select a thread above once it appears, or refresh if you just got assigned."
+                    : " — add a phone number on each lead in My Leads so WhatsApp threads can appear here."}
+                  {(meta?.missingPhone ?? 0) > 0 && (
+                    <>
+                      {" "}
+                      {meta?.missingPhone} {meta?.missingPhone === 1 ? "lead is" : "leads are"} missing a phone number.
+                    </>
+                  )}
                 </p>
               )}
             </div>

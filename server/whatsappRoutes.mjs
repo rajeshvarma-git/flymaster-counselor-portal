@@ -3,6 +3,7 @@ import {
   appendWhatsAppMessage,
   canStaffReply,
   conversationVisibleToCounselor,
+  computeCounselorWhatsAppMeta,
   ensureCounselorWhatsAppThreads,
   ensureWhatsAppConversation,
   enrichWhatsAppConversations,
@@ -174,10 +175,22 @@ export function mountWhatsAppRoutes(app, {
     try {
       const role = req.user.role;
       const leads = await loadAllLeads(pool);
+      const stageFilter = String(req.query.stage || "").toLowerCase();
       let aliases = null;
+      let meta = null;
       if (role === "counselor") {
         aliases = await counselorAliasesFor(req.user.id);
-        await ensureCounselorWhatsAppThreads(pool, aliases, req.user.id);
+        const syncResult = await ensureCounselorWhatsAppThreads(pool, aliases, req.user.id);
+        meta = {
+          ...computeCounselorWhatsAppMeta(
+            leads,
+            aliases,
+            req.user.id,
+            stageFilter === "lead" || stageFilter === "student" ? stageFilter : "all",
+          ),
+          provisioned: syncResult.provisioned,
+          skippedNoPhone: syncResult.skippedNoPhone,
+        };
       }
       const conversations = await listWhatsAppConversations(pool, (row) => {
         if (role === "admin" || role === "super_admin") return true;
@@ -192,7 +205,6 @@ export function mountWhatsAppRoutes(app, {
         aliases,
         staffRole: role,
       });
-      const stageFilter = String(req.query.stage || "").toLowerCase();
       if (stageFilter === "lead" || stageFilter === "student") {
         enriched = enriched.filter((row) => {
           const lead = findLeadForConversation(row, leads);
@@ -200,7 +212,7 @@ export function mountWhatsAppRoutes(app, {
           return stageFilter === "student" ? isStudent : !isStudent;
         });
       }
-      res.json({ conversations: enriched });
+      res.json({ conversations: enriched, meta });
     } catch (error) {
       res.status(500).json({ error: error.message || "Could not load conversations" });
     }

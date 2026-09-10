@@ -198,7 +198,7 @@ export function resolveActiveHandler(lead) {
   if (!lead) return { handlerId: null, handlerRole: null, stage: "lead" };
   const converted = isConvertedStudent(lead);
   const stage = converted ? "student" : "lead";
-  if (converted && lead.assigned_counselor_id) {
+  if (lead.assigned_counselor_id) {
     return { handlerId: String(lead.assigned_counselor_id), handlerRole: "counselor", stage };
   }
   if (!converted && lead.assigned_telecaller_id) {
@@ -212,8 +212,6 @@ export function counselorCanReply({ lead, conversation, aliases }) {
   const converted = isConvertedStudent(lead);
 
   if (lead && leadOwnedByCounselor(lead, aliases)) {
-    if (converted) return true;
-    if (conversation?.active_handler_role === "telecaller") return false;
     return true;
   }
 
@@ -360,9 +358,12 @@ export function idInAliases(value, aliases) {
 
 const SHARED_STUDENT_COUNSELOR_ID = "local-counselor-1";
 
-export function leadOwnedByCounselor(lead, aliases) {
-  if (!lead || !aliases?.size) return false;
+export function leadOwnedByCounselor(lead, aliases, portalCounselorId = null) {
+  if (!lead) return false;
   const assigned = String(lead.assigned_counselor_id || "");
+  if (!assigned) return false;
+  if (portalCounselorId && assigned === String(portalCounselorId)) return true;
+  if (!aliases?.size) return false;
   if (assigned === SHARED_STUDENT_COUNSELOR_ID) {
     return [...aliases].some((id) => id && id !== SHARED_STUDENT_COUNSELOR_ID);
   }
@@ -379,23 +380,55 @@ export function conversationVisibleToCounselor(conversation, aliases, leads) {
 }
 
 export async function ensureCounselorWhatsAppThreads(pool, aliases, portalCounselorId = null) {
+  if (!aliases?.size) return { provisioned: 0, skippedNoPhone: 0 };
+  const portalId = portalCounselorId
+    ? String(portalCounselorId)
+    : [...aliases].find((id) => id && id !== SHARED_STUDENT_COUNSELOR_ID) || null;
+  if (!portalId) return { provisioned: 0, skippedNoPhone: 0 };
+
   const leads = await loadAllLeads(pool);
-  const portalId = portalCounselorId ? String(portalCounselorId) : [...aliases].find((id) => id && id !== SHARED_STUDENT_COUNSELOR_ID) || null;
+  let provisioned = 0;
+  let skippedNoPhone = 0;
   for (const lead of leads) {
-    if (!leadOwnedByCounselor(lead, aliases)) continue;
-    if (!(lead.phone || lead.whatsapp_number)) continue;
-    const synced = await syncConversationFromLead(pool, lead).catch(() => null);
-    if (synced && isConvertedStudent(lead) && portalId) {
-      await jsonUpsert(pool, "whatsapp_conversations", {
-        ...synced,
-        stage: "student",
-        active_handler_id: portalId,
-        active_handler_role: "counselor",
-        assigned_staff_id: portalId,
-        staff_role: "counselor",
-      }).catch(() => null);
+    if (!leadOwnedByCounselor(lead, aliases, portalId)) continue;
+    const phone = normalizePhone(lead.whatsapp_number || lead.phone || "");
+    if (!phone || phone.length < 12) {
+      skippedNoPhone += 1;
+      continue;
     }
+    const converted = isConvertedStudent(lead);
+    await ensureWhatsAppConversation(pool, {
+      userId: lead.user_id || "",
+      phone,
+      leadId: lead.id,
+      stage: converted ? "student" : "lead",
+      staffId: portalId,
+      staffRole: "counselor",
+      activeHandlerId: portalId,
+      activeHandlerRole: "counselor",
+    });
+    provisioned += 1;
   }
+  return { provisioned, skippedNoPhone };
+}
+
+export function computeCounselorWhatsAppMeta(leads, aliases, portalCounselorId, mode = "all") {
+  const owned = leads.filter((lead) => {
+    if (!leadOwnedByCounselor(lead, aliases, portalCounselorId)) return false;
+    const converted = isConvertedStudent(lead);
+    if (mode === "student") return converted;
+    if (mode === "lead") return !converted;
+    return true;
+  });
+  const withPhone = owned.filter((lead) => {
+    const phone = normalizePhone(lead.whatsapp_number || lead.phone || "");
+    return phone.length >= 12;
+  });
+  return {
+    assigned: owned.length,
+    withPhone: withPhone.length,
+    missingPhone: Math.max(0, owned.length - withPhone.length),
+  };
 }
 
 export async function enrichWhatsAppConversations(pool, conversations, leads, { aliases = null, staffRole = "counselor" } = {}) {
