@@ -30,6 +30,7 @@ const work = [
   { to: "/counselor/students", label: "My Students", icon: Users },
   { to: "/counselor/shortlists", label: "Shortlists", icon: Target },
   { to: "/counselor/chat", label: "Student Chat", icon: MessageCircle },
+  { to: "/counselor/whatsapp", label: "WhatsApp", icon: MessageCircle },
   { to: "/counselor/documents", label: "Documents", icon: FileText },
   { to: "/counselor/applications", label: "Applications", icon: BookOpen },
   { to: "/counselor/notifications", label: "Notifications", icon: Bell },

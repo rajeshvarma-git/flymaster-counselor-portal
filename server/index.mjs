@@ -8,6 +8,7 @@ import { fileURLToPath } from "url";
 import { randomBytes, scryptSync, timingSafeEqual } from "crypto";
 import pg from "pg";
 import { sendVerificationEmail } from "./email.mjs";
+import { mountWhatsAppRoutes } from "../../shared/whatsappRoutes.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, "..");
@@ -2178,6 +2179,20 @@ if (IS_PRODUCTION) {
     });
   }
 }
+
+mountWhatsAppRoutes(app, {
+  pool,
+  verifyJwt: (token) => {
+    try {
+      const claims = jwt.verify(token, JWT_SECRET);
+      return { ...claims, role: "counselor" };
+    } catch {
+      return null;
+    }
+  },
+  notify: notifyCounselor,
+  staffRoles: ["counselor"],
+});
 
 app.use("/api", (_req, res) => {
   res.status(404).json({ error: "Unknown API route." });

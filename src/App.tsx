@@ -10,6 +10,7 @@ import MyLeads from "@/counselor/MyLeads";
 import MyStudents from "@/counselor/MyStudents";
 import Shortlists from "@/counselor/Shortlists";
 import CounselorChat from "@/counselor/CounselorChat";
+import WhatsAppChat from "@/counselor/WhatsAppChat";
 import Documents from "@/counselor/Documents";
 import DocumentsSetup from "@/counselor/DocumentsSetup";
 import Applications from "@/counselor/Applications";
@@ -72,6 +73,7 @@ export default function App() {
             <Route path="students" element={<MyStudents />} />
             <Route path="shortlists" element={<Shortlists />} />
             <Route path="chat" element={<CounselorChat />} />
+            <Route path="whatsapp" element={<WhatsAppChat />} />
             <Route path="documents" element={<Documents />} />
             <Route path="documents/setup" element={<DocumentsSetup />} />
             <Route path="applications" element={<Applications />} />
