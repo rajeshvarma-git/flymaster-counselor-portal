@@ -9,6 +9,7 @@ import { randomBytes, scryptSync, timingSafeEqual } from "crypto";
 import pg from "pg";
 import { sendVerificationEmail } from "./email.mjs";
 import { mountWhatsAppRoutes } from "./whatsappRoutes.mjs";
+import { handoffOnConversion, syncConversationFromLead } from "./whatsappStore.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, "..");
@@ -391,6 +392,10 @@ async function resolveCounselorAliases(portalCounselorId) {
         if (rowId) aliases.add(rowId);
         if (rowUserId) aliases.add(rowUserId);
       }
+    }
+    const sqlCounselors = await pool.query("SELECT id FROM counselor_users WHERE lower(email) = $1", [email]).catch(() => ({ rows: [] }));
+    for (const row of sqlCounselors.rows) {
+      if (row.id) aliases.add(String(row.id));
     }
   }
   return aliases;
@@ -1317,12 +1322,24 @@ app.patch("/api/leads/:id", auth, async (req, res) => {
   const sets = Object.keys(patch).map((key, index) => `${key} = $${index + 2}`);
   const values = Object.values(patch);
   await pool.query(`UPDATE student_leads SET ${sets.join(", ")} WHERE id = $1`, [req.params.id, ...values]).catch(() => {});
-  await jsonUpsert("student_leads", { ...current, ...patch, id: current.id || req.params.id });
+  const updated = { ...current, ...patch, id: current.id || req.params.id };
+  await jsonUpsert("student_leads", updated);
+  if (converting) {
+    await handoffOnConversion(pool, req.params.id).catch(() => {});
+  } else {
+    await syncConversationFromLead(pool, updated).catch(() => {});
+  }
   res.json({ ok: true });
 });
 
 app.post("/api/leads/:id/claim", auth, async (req, res) => {
   await pool.query("UPDATE student_leads SET assigned_counselor_id = $2, status = 'assigned' WHERE id = $1", [req.params.id, req.user.id]);
+  const jsonLeads = await jsonTable("student_leads").catch(() => []);
+  const lead = jsonLeads.find((row) => String(row.id) === String(req.params.id));
+  if (lead) {
+    await jsonUpsert("student_leads", { ...lead, assigned_counselor_id: req.user.id, status: "assigned" });
+    await syncConversationFromLead(pool, { ...lead, assigned_counselor_id: req.user.id, status: "assigned" }).catch(() => {});
+  }
   res.json({ ok: true });
 });
 

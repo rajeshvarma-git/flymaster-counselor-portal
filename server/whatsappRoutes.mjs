@@ -14,6 +14,7 @@ import {
   jsonUpsert,
   listWhatsAppConversations,
   listWhatsAppMessages,
+  loadAllLeads,
   resolveSessionUser,
   sendOtpForUser,
   sendStaffWhatsAppReply,
@@ -52,7 +53,7 @@ export function mountWhatsAppRoutes(app, {
   }
 
   async function counselorCanAccessConversation(conversationId, userId) {
-    const leads = await jsonTable(pool, "student_leads");
+    const leads = await loadAllLeads(pool);
     const conversations = await jsonTable(pool, "whatsapp_conversations");
     const conversation = conversations.find((row) => String(row.id) === String(conversationId));
     if (!conversation) return { ok: false, status: 404, error: "Conversation not found." };
@@ -165,11 +166,11 @@ export function mountWhatsAppRoutes(app, {
   app.get("/api/whatsapp/conversations", portalSession, requireStaff, async (req, res) => {
     try {
       const role = req.user.role;
-      const leads = await jsonTable(pool, "student_leads");
+      const leads = await loadAllLeads(pool);
       let aliases = null;
       if (role === "counselor") {
         aliases = await counselorAliasesFor(req.user.id);
-        await ensureCounselorWhatsAppThreads(pool, aliases);
+        await ensureCounselorWhatsAppThreads(pool, aliases, req.user.id);
       }
       const conversations = await listWhatsAppConversations(pool, (row) => {
         if (role === "admin" || role === "super_admin") return true;

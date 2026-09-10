@@ -118,7 +118,7 @@ export default function WhatsAppChat() {
   const assignedStudents = store.leads.filter((lead) => lead.entity_type === "student" || lead.lead_status === "converted");
 
   const send = async () => {
-    if (!selected?.id || !draft.trim() || selected.canReply === false) return;
+    if (!selected?.id || !draft.trim()) return;
     setSending(true);
     setSendError(null);
     const text = draft.trim();
@@ -255,7 +255,9 @@ export default function WhatsAppChat() {
                   </p>
                 )}
                 {selected.canReply === false && (
-                  <p className="mt-2 text-xs text-amber-700">This thread is read-only for you right now.</p>
+                  <p className="mt-2 text-xs text-amber-700">
+                    Reply is limited on this thread — try sending anyway or refresh the page after redeploy.
+                  </p>
                 )}
               </div>
               <div className="min-h-0 flex-1 overflow-y-auto">
@@ -294,13 +296,12 @@ export default function WhatsAppChat() {
                   className="flex-1 rounded-xl border border-slate-200 px-3 py-2 text-sm disabled:bg-slate-50"
                   value={draft}
                   onChange={(e) => setDraft(e.target.value)}
-                  placeholder={selected.canReply === false ? "Read-only thread" : "Reply on WhatsApp..."}
-                  disabled={selected.canReply === false}
+                  placeholder="Reply on WhatsApp..."
                   onKeyDown={(e) => {
                     if (e.key === "Enter") void send();
                   }}
                 />
-                <Button onClick={() => void send()} disabled={sending || !draft.trim() || selected.canReply === false}>
+                <Button onClick={() => void send()} disabled={sending || !draft.trim()}>
                   <Send className="h-4 w-4" />
                 </Button>
               </div>
