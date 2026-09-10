@@ -10,8 +10,27 @@ export function getWhatsAppConfig() {
     phoneNumberId: String(process.env.WHATSAPP_PHONE_NUMBER_ID || "").trim(),
     webhookVerifyToken: String(process.env.WHATSAPP_WEBHOOK_VERIFY_TOKEN || "flymasters_whatsapp").trim(),
     otpTemplateName: String(process.env.WHATSAPP_OTP_TEMPLATE || "flymasters_otp").trim(),
+    replyTemplateName: String(process.env.WHATSAPP_REPLY_TEMPLATE || "").trim(),
     apiVersion: String(process.env.WHATSAPP_API_VERSION || "v21.0").trim(),
   };
+}
+
+export function friendlyWhatsAppError(error, code) {
+  const text = String(error || "");
+  const numeric = Number(code);
+  if (numeric === 131047 || /24.?hour|re-engagement/i.test(text)) {
+    return "WhatsApp only allows free-text replies within 24 hours of the student's last message. Ask them to message you first, or set WHATSAPP_REPLY_TEMPLATE in Railway for template replies.";
+  }
+  if (numeric === 131026 || /undeliverable|not a valid whatsapp/i.test(text)) {
+    return "This number is not reachable on WhatsApp. Check the student's phone number.";
+  }
+  if (numeric === 100 || /phone number id/i.test(text)) {
+    return "WhatsApp phone number ID mismatch. Confirm WHATSAPP_PHONE_NUMBER_ID in Railway matches Meta → WhatsApp → API Setup.";
+  }
+  if (/access token|expired|session/i.test(text)) {
+    return "WhatsApp access token is invalid or expired. Generate a new token in Meta and update WHATSAPP_ACCESS_TOKEN in Railway.";
+  }
+  return text || "WhatsApp send failed.";
 }
 
 export function isWhatsAppConfigured() {
@@ -97,7 +116,7 @@ async function graphRequest(path, body, phoneNumberId) {
     const code = data?.error?.code;
     const message = data?.error?.message || `WhatsApp API error (${res.status})`;
     console.error("[whatsapp] send failed:", { code, message, to: body?.to, phoneNumberId: senderPhoneId });
-    return { ok: false, error: message, code, data };
+    return { ok: false, error: friendlyWhatsAppError(message, code), code, rawError: message, data };
   }
   return { ok: true, data };
 }
@@ -165,10 +184,44 @@ export async function sendWhatsAppOtp(phone, code) {
   return result;
 }
 
+export async function sendWhatsAppTemplateText(phone, message, templateName, phoneNumberId) {
+  const validated = validateWhatsAppSendPhone(phone);
+  if (!validated.ok) return validated;
+  const to = validated.to;
+  const cfg = getWhatsAppConfig();
+  const name = String(templateName || cfg.replyTemplateName || "").trim();
+  if (!name) return { ok: false, error: "No WhatsApp reply template configured." };
+  return graphRequest(
+    "/messages",
+    {
+      messaging_product: "whatsapp",
+      to,
+      type: "template",
+      template: {
+        name,
+        language: { code: "en" },
+        components: [
+          {
+            type: "body",
+            parameters: [{ type: "text", text: String(message || "").slice(0, 1024) }],
+          },
+        ],
+      },
+    },
+    phoneNumberId,
+  ).then((result) =>
+    result.ok
+      ? { ok: true, waMessageId: result.data?.messages?.[0]?.id || null, viaTemplate: true }
+      : result,
+  );
+}
+
 export async function sendWhatsAppText(phone, message, phoneNumberId) {
   const validated = validateWhatsAppSendPhone(phone);
   if (!validated.ok) return validated;
   const to = validated.to;
+  const cfg = getWhatsAppConfig();
+  const senderPhoneId = String(phoneNumberId || cfg.phoneNumberId || "").trim();
   if (!isWhatsAppConfigured()) {
     console.log(`[whatsapp:dev] Message to +${to}: ${message}`);
     return { ok: true, dev: true, waMessageId: `dev-${Date.now()}` };
@@ -182,11 +235,19 @@ export async function sendWhatsAppText(phone, message, phoneNumberId) {
       type: "text",
       text: { preview_url: false, body: message },
     },
-    phoneNumberId,
+    senderPhoneId,
   );
-  return result.ok
-    ? { ok: true, waMessageId: result.data?.messages?.[0]?.id || null }
-    : result;
+  if (result.ok) {
+    return { ok: true, waMessageId: result.data?.messages?.[0]?.id || null };
+  }
+  const shouldTryTemplate =
+    cfg.replyTemplateName &&
+    (result.code === 131047 || /24.?hour|re-engagement|template/i.test(result.rawError || result.error || ""));
+  if (shouldTryTemplate) {
+    const fallback = await sendWhatsAppTemplateText(to, message, cfg.replyTemplateName, senderPhoneId);
+    if (fallback.ok) return fallback;
+  }
+  return result;
 }
 
 export function parseIncomingWebhook(body) {
@@ -209,6 +270,7 @@ export function parseIncomingWebhook(body) {
         }
       }
       for (const status of value?.statuses || []) {
+        const statusError = Array.isArray(status.errors) ? status.errors[0] : null;
         messages.push({
           kind: "status",
           waMessageId: status.id,
@@ -216,6 +278,8 @@ export function parseIncomingWebhook(body) {
           recipient: normalizePhone(status.recipient_id),
           timestamp: status.timestamp,
           businessPhoneId,
+          errorCode: statusError?.code || null,
+          errorMessage: statusError?.title || statusError?.message || null,
         });
       }
     }

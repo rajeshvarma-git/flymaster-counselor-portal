@@ -59,6 +59,7 @@ export default function WhatsAppChat() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [status, setStatus] = useState<WhatsAppStatus | null>(null);
   const [sendError, setSendError] = useState<string | null>(null);
+  const [windowStatus, setWindowStatus] = useState<{ open: boolean; reason?: string } | null>(null);
 
   useEffect(() => {
     void api<WhatsAppStatus>("/whatsapp/status", { auth: false })
@@ -96,8 +97,11 @@ export default function WhatsAppChat() {
       return;
     }
     const loadMessages = () =>
-      api<{ messages: WhatsAppMessage[] }>(`/whatsapp/conversations/${selected.id}/messages`).then((data) => {
+      api<{ messages: WhatsAppMessage[]; windowStatus?: { open: boolean; reason?: string } }>(
+        `/whatsapp/conversations/${selected.id}/messages`,
+      ).then((data) => {
         setMessages(data.messages || []);
+        setWindowStatus(data.windowStatus || null);
         void api(`/whatsapp/conversations/${selected.id}/read`, { method: "POST" }).catch(() => {});
       });
     void loadMessages();
@@ -254,9 +258,9 @@ export default function WhatsAppChat() {
                     {unknownCount > 1 ? ` ${unknownCount} unlinked chats total.` : ""}
                   </p>
                 )}
-                {selected.canReply === false && (
-                  <p className="mt-2 text-xs text-amber-700">
-                    Reply is limited on this thread — try sending anyway or refresh the page after redeploy.
+                {windowStatus && !windowStatus.open && (
+                  <p className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                    {windowStatus.reason}
                   </p>
                 )}
               </div>
@@ -281,8 +285,10 @@ export default function WhatsAppChat() {
                         <span>{item.created_at ? format(new Date(item.created_at), "PP p") : ""}</span>
                         {item.channel && <span>{item.channel === "app" ? "In-app" : "WhatsApp"}</span>}
                         {item.delivery_status && (
-                          <span className={item.delivery_status.startsWith("failed") ? "text-red-500" : ""}>
-                            {item.delivery_status.replace(/^failed:\s*/i, "Failed: ")}
+                          <span className={item.delivery_status.startsWith("failed") ? "font-medium text-red-600" : ""}>
+                            {item.delivery_status.startsWith("failed")
+                              ? item.delivery_status.replace(/^failed:\s*/i, "")
+                              : item.delivery_status}
                           </span>
                         )}
                       </div>

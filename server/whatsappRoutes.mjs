@@ -8,6 +8,7 @@ import {
   enrichWhatsAppConversations,
   findLeadForConversation,
   findLeadForUser,
+  getMessagingWindowStatus,
   getVerificationStatus,
   handleIncomingWhatsApp,
   jsonTable,
@@ -104,7 +105,12 @@ export function mountWhatsAppRoutes(app, {
         if (item.kind === "status") {
           const rows = await jsonTable(pool, "whatsapp_messages");
           const message = rows.find((row) => String(row.wa_message_id) === String(item.waMessageId));
-          if (message) await jsonUpsert(pool, "whatsapp_messages", { ...message, delivery_status: item.status });
+          if (message) {
+            const failedDetail = item.status === "failed" && item.errorMessage
+              ? `failed: ${item.errorMessage}`
+              : item.status;
+            await jsonUpsert(pool, "whatsapp_messages", { ...message, delivery_status: failedDetail });
+          }
           if (item.businessPhoneId && item.recipient) {
             const conversations = await jsonTable(pool, "whatsapp_conversations");
             const conversation = conversations.find(
@@ -197,8 +203,11 @@ export function mountWhatsAppRoutes(app, {
         const access = await counselorCanAccessConversation(req.params.id, req.user.id);
         if (!access.ok) return res.status(access.status || 403).json({ error: access.error });
       }
-      const messages = await listWhatsAppMessages(pool, req.params.id);
-      res.json({ messages });
+      const [messages, windowStatus] = await Promise.all([
+        listWhatsAppMessages(pool, req.params.id),
+        getMessagingWindowStatus(pool, req.params.id),
+      ]);
+      res.json({ messages, windowStatus });
     } catch (error) {
       res.status(500).json({ error: error.message || "Could not load messages" });
     }

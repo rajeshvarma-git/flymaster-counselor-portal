@@ -3,6 +3,7 @@ import {
   OTP_MAX_ATTEMPTS,
   OTP_RESEND_SECONDS,
   generateOtp,
+  getWhatsAppConfig,
   hashOtp,
   normalizePhone,
   otpExpiryDate,
@@ -10,6 +11,8 @@ import {
   sendWhatsAppText,
   verifyOtpHash,
 } from "./whatsapp.mjs";
+
+const MESSAGING_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 export async function jsonTable(pool, tableName) {
   const result = await pool.query("SELECT data FROM app_records WHERE table_name = $1", [tableName]).catch(() => ({ rows: [] }));
@@ -490,6 +493,25 @@ export async function listWhatsAppMessages(pool, conversationId) {
     .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
 }
 
+export async function getMessagingWindowStatus(pool, conversationId) {
+  const messages = await listWhatsAppMessages(pool, conversationId);
+  const inbound = messages.filter((row) => row.direction === "inbound");
+  const lastInbound = inbound[inbound.length - 1];
+  if (!lastInbound?.created_at) {
+    return { open: false, reason: "The student has not messaged on WhatsApp yet. They must message your business number first." };
+  }
+  const elapsed = Date.now() - Date.parse(lastInbound.created_at);
+  if (elapsed > MESSAGING_WINDOW_MS) {
+    const hours = Math.floor(elapsed / (60 * 60 * 1000));
+    return {
+      open: false,
+      reason: `The 24-hour reply window closed about ${hours} hours ago. Ask the student to send a new WhatsApp message, or configure WHATSAPP_REPLY_TEMPLATE in Railway.`,
+      lastInboundAt: lastInbound.created_at,
+    };
+  }
+  return { open: true, lastInboundAt: lastInbound.created_at };
+}
+
 export async function appendWhatsAppMessage(pool, {
   conversationId,
   direction,
@@ -551,7 +573,23 @@ export async function sendStaffWhatsAppReply(pool, { conversationId, staffId, bo
   });
 
   const recipientPhone = normalizePhone(conversation.phone_number || "");
-  const senderPhoneId = conversation.business_phone_id || null;
+  const cfg = getWhatsAppConfig();
+  const senderPhoneId = cfg.phoneNumberId;
+  const windowStatus = await getMessagingWindowStatus(pool, conversationId);
+  if (!windowStatus.open && !cfg.replyTemplateName) {
+    const message = await appendWhatsAppMessage(pool, {
+      conversationId,
+      direction: "outbound",
+      body: text,
+      senderId: staffId,
+      senderType: "staff",
+      channel: "whatsapp",
+      waMessageId: null,
+      status: `failed: ${windowStatus.reason}`,
+    });
+    return { error: windowStatus.reason, status: 400, message, windowClosed: true };
+  }
+
   const sent = await sendWhatsAppText(recipientPhone, text, senderPhoneId);
   if (!sent.ok) {
     const message = await appendWhatsAppMessage(pool, {
@@ -573,9 +611,9 @@ export async function sendStaffWhatsAppReply(pool, { conversationId, staffId, bo
     body: text,
     senderId: staffId,
     senderType: "staff",
-    channel: "whatsapp",
+    channel: sent.viaTemplate ? "whatsapp_template" : "whatsapp",
     waMessageId: sent.waMessageId || null,
-    status: sent.dev ? "sent (dev)" : "sent",
+    status: sent.dev ? "sent (dev)" : sent.viaTemplate ? "sent (template)" : "sent",
   });
 
   if (notify && conversation.user_id) {
