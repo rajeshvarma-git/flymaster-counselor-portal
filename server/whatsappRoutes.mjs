@@ -34,13 +34,30 @@ export function mountWhatsAppRoutes(app, { pool, verifyJwt, notify, staffRoles =
 
   app.get("/api/whatsapp/webhook", (req, res) => {
     const cfg = getWhatsAppConfig();
-    const mode = req.query["hub.mode"];
-    const token = req.query["hub.verify_token"];
+    const mode = String(req.query["hub.mode"] || "");
+    const token = String(req.query["hub.verify_token"] || "").trim();
     const challenge = req.query["hub.challenge"];
-    if (mode === "subscribe" && token === cfg.webhookVerifyToken) {
-      return res.status(200).send(String(challenge || ""));
+    const expected = cfg.webhookVerifyToken;
+    console.log("[whatsapp] verify request", {
+      mode,
+      hasChallenge: challenge != null && challenge !== "",
+      tokenMatches: token === expected,
+    });
+    if (mode === "subscribe" && token && token === expected) {
+      return res.status(200).type("text/plain").send(String(challenge ?? ""));
     }
-    return res.status(403).send("Forbidden");
+    console.warn("[whatsapp] verify rejected — check WHATSAPP_WEBHOOK_VERIFY_TOKEN in Railway");
+    return res.status(403).type("text/plain").send("Forbidden");
+  });
+
+  app.get("/api/whatsapp/status", (_req, res) => {
+    const cfg = getWhatsAppConfig();
+    res.json({
+      ok: true,
+      webhookReady: Boolean(cfg.webhookVerifyToken),
+      verifyTokenLength: cfg.webhookVerifyToken.length,
+      whatsappApiConfigured: Boolean(cfg.accessToken && cfg.phoneNumberId),
+    });
   });
 
   app.post("/api/whatsapp/webhook", async (req, res) => {
