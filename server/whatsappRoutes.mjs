@@ -9,6 +9,7 @@ import {
   findLeadForConversation,
   findLeadForUser,
   getMessagingWindowStatus,
+  isConvertedStudent,
   getVerificationStatus,
   handleIncomingWhatsApp,
   jsonTable,
@@ -187,10 +188,18 @@ export function mountWhatsAppRoutes(app, {
         }
         return false;
       });
-      const enriched = await enrichWhatsAppConversations(pool, conversations, leads, {
+      let enriched = await enrichWhatsAppConversations(pool, conversations, leads, {
         aliases,
         staffRole: role,
       });
+      const stageFilter = String(req.query.stage || "").toLowerCase();
+      if (stageFilter === "lead" || stageFilter === "student") {
+        enriched = enriched.filter((row) => {
+          const lead = findLeadForConversation(row, leads);
+          const isStudent = row.stage === "student" || isConvertedStudent(lead);
+          return stageFilter === "student" ? isStudent : !isStudent;
+        });
+      }
       res.json({ conversations: enriched });
     } catch (error) {
       res.status(500).json({ error: error.message || "Could not load conversations" });
@@ -273,7 +282,10 @@ export function mountWhatsAppRoutes(app, {
       });
       const staffId = lead?.assigned_counselor_id || lead?.assigned_telecaller_id;
       if (notify && staffId) {
-        await notify(staffId, "New in-app message", text.slice(0, 140), "info", lead?.assigned_counselor_id ? "/counselor/whatsapp" : "/admin/telecallers");
+        const notifyUrl = lead?.assigned_counselor_id
+          ? (lead?.entity_type === "student" || lead?.lead_status === "converted" ? "/counselor/whatsapp/students" : "/counselor/whatsapp/leads")
+          : "/admin/telecallers";
+        await notify(staffId, "New in-app message", text.slice(0, 140), "info", notifyUrl);
       }
       res.json({ message, conversation });
     } catch (error) {

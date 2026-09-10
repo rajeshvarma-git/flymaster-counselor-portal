@@ -676,9 +676,10 @@ export async function handleIncomingWhatsApp(pool, { from, body, waMessageId, no
   const name = [lead.first_name, lead.last_name].filter(Boolean).join(" ") || phone;
   if (notify) {
     if (handlerId) {
+      const counselorUrl = isConvertedStudent(lead) ? "/counselor/whatsapp/students" : "/counselor/whatsapp/leads";
       const actionUrl =
         handlerRole === "counselor"
-          ? "/counselor/whatsapp"
+          ? counselorUrl
           : handlerRole === "telecaller"
             ? "/admin/inbox"
             : "/admin/whatsapp";
