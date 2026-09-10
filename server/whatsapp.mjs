@@ -64,25 +64,70 @@ export function otpExpiryDate() {
 
 export { OTP_EXPIRY_MINUTES, OTP_RESEND_SECONDS, OTP_MAX_ATTEMPTS };
 
-async function graphRequest(path, body) {
+export function validateWhatsAppSendPhone(value) {
+  const to = normalizePhone(value);
+  if (!to) return { ok: false, error: "No recipient phone number on this conversation." };
+  if (to.length === 12 && to.startsWith("91")) return { ok: true, to };
+  if (to.length >= 10 && to.length <= 15) return { ok: true, to };
+  return { ok: false, error: `Invalid WhatsApp phone number: ${value}` };
+}
+
+async function graphRequest(path, body, phoneNumberId) {
   const cfg = getWhatsAppConfig();
-  if (!cfg.accessToken || !cfg.phoneNumberId) {
-    return { ok: false, dev: true, error: "WhatsApp API is not configured." };
+  const senderPhoneId = String(phoneNumberId || cfg.phoneNumberId || "").trim();
+  if (!cfg.accessToken || !senderPhoneId) {
+    return { ok: false, dev: true, error: "WhatsApp API is not configured. Set WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID in Railway." };
   }
-  const res = await fetch(`https://graph.facebook.com/${cfg.apiVersion}/${cfg.phoneNumberId}${path}`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${cfg.accessToken}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
+  let res;
+  try {
+    res = await fetch(`https://graph.facebook.com/${cfg.apiVersion}/${senderPhoneId}${path}`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${cfg.accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+  } catch (error) {
+    console.error("[whatsapp] network error:", error.message || error);
+    return { ok: false, error: "Could not reach WhatsApp API. Try again in a moment." };
+  }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
+    const code = data?.error?.code;
     const message = data?.error?.message || `WhatsApp API error (${res.status})`;
-    return { ok: false, error: message, data };
+    console.error("[whatsapp] send failed:", { code, message, to: body?.to, phoneNumberId: senderPhoneId });
+    return { ok: false, error: message, code, data };
   }
   return { ok: true, data };
+}
+
+export async function verifyWhatsAppCredentials() {
+  const cfg = getWhatsAppConfig();
+  if (!cfg.accessToken || !cfg.phoneNumberId) {
+    return { ok: false, configured: false, error: "WhatsApp credentials are missing." };
+  }
+  try {
+    const res = await fetch(`https://graph.facebook.com/${cfg.apiVersion}/${cfg.phoneNumberId}`, {
+      headers: { Authorization: `Bearer ${cfg.accessToken}` },
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      return {
+        ok: false,
+        configured: true,
+        error: data?.error?.message || `WhatsApp credential check failed (${res.status})`,
+      };
+    }
+    return {
+      ok: true,
+      configured: true,
+      displayPhone: data?.display_phone_number || null,
+      verifiedName: data?.verified_name || null,
+    };
+  } catch (error) {
+    return { ok: false, configured: true, error: error.message || "Could not verify WhatsApp credentials." };
+  }
 }
 
 export async function sendWhatsAppOtp(phone, code) {
@@ -120,18 +165,25 @@ export async function sendWhatsAppOtp(phone, code) {
   return result;
 }
 
-export async function sendWhatsAppText(phone, message) {
-  const to = normalizePhone(phone);
+export async function sendWhatsAppText(phone, message, phoneNumberId) {
+  const validated = validateWhatsAppSendPhone(phone);
+  if (!validated.ok) return validated;
+  const to = validated.to;
   if (!isWhatsAppConfigured()) {
     console.log(`[whatsapp:dev] Message to +${to}: ${message}`);
     return { ok: true, dev: true, waMessageId: `dev-${Date.now()}` };
   }
-  const result = await graphRequest("/messages", {
-    messaging_product: "whatsapp",
-    to,
-    type: "text",
-    text: { body: message },
-  });
+  const result = await graphRequest(
+    "/messages",
+    {
+      messaging_product: "whatsapp",
+      recipient_type: "individual",
+      to,
+      type: "text",
+      text: { preview_url: false, body: message },
+    },
+    phoneNumberId,
+  );
   return result.ok
     ? { ok: true, waMessageId: result.data?.messages?.[0]?.id || null }
     : result;
@@ -143,13 +195,16 @@ export function parseIncomingWebhook(body) {
   for (const entry of entries) {
     for (const change of entry?.changes || []) {
       const value = change?.value;
+      const businessPhoneId = String(value?.metadata?.phone_number_id || "").trim() || null;
       for (const item of value?.messages || []) {
         if (item.type === "text" && item.text?.body) {
           messages.push({
+            kind: "message",
             waMessageId: item.id,
             from: normalizePhone(item.from),
             body: item.text.body,
             timestamp: item.timestamp,
+            businessPhoneId,
           });
         }
       }
@@ -160,6 +215,7 @@ export function parseIncomingWebhook(body) {
           status: status.status,
           recipient: normalizePhone(status.recipient_id),
           timestamp: status.timestamp,
+          businessPhoneId,
         });
       }
     }

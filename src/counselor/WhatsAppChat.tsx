@@ -32,6 +32,9 @@ interface WhatsAppStatus {
   ok: boolean;
   webhookReady: boolean;
   whatsappApiConfigured: boolean;
+  credentialsValid?: boolean;
+  credentialError?: string | null;
+  displayPhone?: string | null;
 }
 
 function formatPhone(phone: string) {
@@ -50,6 +53,7 @@ export default function WhatsAppChat() {
   const [sending, setSending] = useState(false);
   const [loading, setLoading] = useState(true);
   const [status, setStatus] = useState<WhatsAppStatus | null>(null);
+  const [sendError, setSendError] = useState<string | null>(null);
 
   useEffect(() => {
     void api<WhatsAppStatus>("/whatsapp/status", { auth: false })
@@ -105,27 +109,31 @@ export default function WhatsAppChat() {
   const send = async () => {
     if (!selected?.id || !draft.trim()) return;
     setSending(true);
+    setSendError(null);
+    const text = draft.trim();
     try {
       const result = await api<{ message: WhatsAppMessage }>("/whatsapp/messages", {
         method: "POST",
-        body: { conversationId: selected.id, message: draft.trim() },
+        body: { conversationId: selected.id, message: text },
       });
       setMessages((prev) => [...prev, result.message]);
       setDraft("");
       setConversations((prev) =>
         prev.map((item) =>
           item.id === selected.id
-            ? { ...item, last_message: draft.trim(), is_unknown: false, unread_count: 0 }
+            ? { ...item, last_message: text, is_unknown: false, unread_count: 0 }
             : item,
         ),
       );
+    } catch (error) {
+      setSendError(error instanceof Error ? error.message : "Could not send WhatsApp message.");
     } finally {
       setSending(false);
     }
   };
 
   const unknownCount = conversations.filter((item) => item.is_unknown).length;
-  const whatsappReady = status?.whatsappApiConfigured && status?.webhookReady;
+  const whatsappReady = status?.credentialsValid && status?.webhookReady;
 
   return (
     <div>
@@ -141,11 +149,21 @@ export default function WhatsAppChat() {
         <Card className="mb-4 flex items-start gap-3 border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">
           <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
           <div>
-            <p className="font-medium">WhatsApp is not fully configured on the server.</p>
+            <p className="font-medium">WhatsApp sending is not working on the server.</p>
             <p className="mt-1 text-amber-800">
-              Ask admin to set WHATSAPP_ACCESS_TOKEN, WHATSAPP_PHONE_NUMBER_ID, and WHATSAPP_WEBHOOK_VERIFY_TOKEN in
-              Railway, then point the Meta webhook to this app&apos;s /api/whatsapp/webhook URL.
+              {status.credentialError ||
+                "Ask admin to set WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID in Railway (same values as the Meta WhatsApp number that receives student messages)."}
             </p>
+          </div>
+        </Card>
+      )}
+
+      {sendError && (
+        <Card className="mb-4 flex items-start gap-3 border-red-200 bg-red-50 p-4 text-sm text-red-900">
+          <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+          <div>
+            <p className="font-medium">Message could not be sent</p>
+            <p className="mt-1 text-red-800">{sendError}</p>
           </div>
         </Card>
       )}
@@ -214,7 +232,11 @@ export default function WhatsAppChat() {
                       <div className={`mt-1 flex flex-wrap gap-2 text-[10px] ${fromStudent ? "text-slate-400" : "text-white/70"}`}>
                         <span>{item.created_at ? format(new Date(item.created_at), "PP p") : ""}</span>
                         {item.channel && <span>{item.channel === "app" ? "In-app" : "WhatsApp"}</span>}
-                        {item.delivery_status && <span>{item.delivery_status}</span>}
+                        {item.delivery_status && (
+                          <span className={item.delivery_status.startsWith("failed") ? "text-red-500" : ""}>
+                            {item.delivery_status.replace(/^failed:\s*/i, "Failed: ")}
+                          </span>
+                        )}
                       </div>
                     </div>
                   );

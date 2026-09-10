@@ -229,27 +229,30 @@ export async function enrichWhatsAppConversations(pool, conversations, leads) {
   });
 }
 
-export async function ensureWhatsAppConversation(pool, { userId, phone, staffId, staffRole, leadId }) {
+export async function ensureWhatsAppConversation(pool, { userId, phone, staffId, staffRole, leadId, businessPhoneId }) {
+  const normalizedPhone = phone ? normalizePhone(phone) : "";
   const rows = await jsonTable(pool, "whatsapp_conversations");
   const existing = rows.find(
     (row) =>
-      String(row.user_id) === String(userId) ||
-      (phone && String(row.phone_number) === String(phone)) ||
+      (userId && String(row.user_id) === String(userId)) ||
+      (normalizedPhone && normalizePhone(row.phone_number || "") === normalizedPhone) ||
       (leadId && String(row.lead_id) === String(leadId)),
   );
   if (existing) {
     const next = {
       ...existing,
       user_id: String(userId || existing.user_id || ""),
-      phone_number: phone || existing.phone_number,
+      phone_number: normalizedPhone || normalizePhone(existing.phone_number || ""),
       assigned_staff_id: staffId || existing.assigned_staff_id,
       staff_role: staffRole || existing.staff_role,
       lead_id: leadId || existing.lead_id,
+      business_phone_id: businessPhoneId || existing.business_phone_id || null,
     };
     if (
       next.user_id !== existing.user_id ||
       next.phone_number !== existing.phone_number ||
-      next.assigned_staff_id !== existing.assigned_staff_id
+      next.assigned_staff_id !== existing.assigned_staff_id ||
+      next.business_phone_id !== existing.business_phone_id
     ) {
       await jsonUpsert(pool, "whatsapp_conversations", next);
     }
@@ -259,7 +262,8 @@ export async function ensureWhatsAppConversation(pool, { userId, phone, staffId,
     id: crypto.randomUUID(),
     user_id: String(userId || ""),
     lead_id: leadId || null,
-    phone_number: phone || "",
+    phone_number: normalizedPhone || "",
+    business_phone_id: businessPhoneId || null,
     assigned_staff_id: staffId || null,
     staff_role: staffRole || null,
     last_message_at: null,
@@ -333,7 +337,23 @@ export async function sendStaffWhatsAppReply(pool, { conversationId, staffId, bo
     });
   }
 
-  const sent = await sendWhatsAppText(conversation.phone_number, text);
+  const recipientPhone = normalizePhone(conversation.phone_number || "");
+  const senderPhoneId = conversation.business_phone_id || null;
+  const sent = await sendWhatsAppText(recipientPhone, text, senderPhoneId);
+  if (!sent.ok) {
+    const message = await appendWhatsAppMessage(pool, {
+      conversationId,
+      direction: "outbound",
+      body: text,
+      senderId: staffId,
+      senderType: "staff",
+      channel: "whatsapp",
+      waMessageId: null,
+      status: `failed: ${sent.error || "WhatsApp send failed"}`,
+    });
+    return { error: sent.error || "WhatsApp send failed.", status: 502, message };
+  }
+
   const message = await appendWhatsAppMessage(pool, {
     conversationId,
     direction: "outbound",
@@ -342,7 +362,7 @@ export async function sendStaffWhatsAppReply(pool, { conversationId, staffId, bo
     senderType: "staff",
     channel: "whatsapp",
     waMessageId: sent.waMessageId || null,
-    status: sent.ok ? "sent" : "failed",
+    status: sent.dev ? "sent (dev)" : "sent",
   });
 
   if (notify && conversation.user_id) {
@@ -351,7 +371,7 @@ export async function sendStaffWhatsAppReply(pool, { conversationId, staffId, bo
   return { ok: true, message, dev: sent.dev };
 }
 
-export async function handleIncomingWhatsApp(pool, { from, body, waMessageId, notify }) {
+export async function handleIncomingWhatsApp(pool, { from, body, waMessageId, notify, businessPhoneId }) {
   const phone = normalizePhone(from);
   const profiles = await jsonTable(pool, "profiles");
   const profile = profiles.find((row) => normalizePhone(row.whatsapp_number || row.phone || "") === phone);
@@ -370,6 +390,7 @@ export async function handleIncomingWhatsApp(pool, { from, body, waMessageId, no
     staffId,
     staffRole,
     leadId: lead?.id || null,
+    businessPhoneId,
   });
 
   const message = await appendWhatsAppMessage(pool, {

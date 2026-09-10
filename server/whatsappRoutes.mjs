@@ -1,4 +1,4 @@
-import { getWhatsAppConfig, parseIncomingWebhook } from "./whatsapp.mjs";
+import { getWhatsAppConfig, normalizePhone, parseIncomingWebhook, verifyWhatsAppCredentials } from "./whatsapp.mjs";
 import {
   appendWhatsAppMessage,
   conversationVisibleToCounselor,
@@ -52,13 +52,17 @@ export function mountWhatsAppRoutes(app, { pool, verifyJwt, notify, staffRoles =
     return res.status(403).type("text/plain").send("Forbidden");
   });
 
-  app.get("/api/whatsapp/status", (_req, res) => {
+  app.get("/api/whatsapp/status", async (_req, res) => {
     const cfg = getWhatsAppConfig();
+    const credentials = await verifyWhatsAppCredentials();
     res.json({
-      ok: true,
+      ok: credentials.ok,
       webhookReady: Boolean(cfg.webhookVerifyToken),
       verifyTokenLength: cfg.webhookVerifyToken.length,
       whatsappApiConfigured: Boolean(cfg.accessToken && cfg.phoneNumberId),
+      credentialsValid: credentials.ok,
+      credentialError: credentials.error || null,
+      displayPhone: credentials.displayPhone || null,
     });
   });
 
@@ -70,12 +74,25 @@ export function mountWhatsAppRoutes(app, { pool, verifyJwt, notify, staffRoles =
           const rows = await jsonTable(pool, "whatsapp_messages");
           const message = rows.find((row) => String(row.wa_message_id) === String(item.waMessageId));
           if (message) await jsonUpsert(pool, "whatsapp_messages", { ...message, delivery_status: item.status });
+          if (item.businessPhoneId && item.recipient) {
+            const conversations = await jsonTable(pool, "whatsapp_conversations");
+            const conversation = conversations.find(
+              (row) => normalizePhone(row.phone_number || "") === normalizePhone(item.recipient),
+            );
+            if (conversation && conversation.business_phone_id !== item.businessPhoneId) {
+              await jsonUpsert(pool, "whatsapp_conversations", {
+                ...conversation,
+                business_phone_id: item.businessPhoneId,
+              });
+            }
+          }
           continue;
         }
         await handleIncomingWhatsApp(pool, {
           from: item.from,
           body: item.body,
           waMessageId: item.waMessageId,
+          businessPhoneId: item.businessPhoneId,
           notify,
         });
       }
