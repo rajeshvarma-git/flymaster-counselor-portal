@@ -1,0 +1,339 @@
+import crypto from "crypto";
+import {
+  OTP_MAX_ATTEMPTS,
+  OTP_RESEND_SECONDS,
+  generateOtp,
+  hashOtp,
+  normalizePhone,
+  otpExpiryDate,
+  sendWhatsAppOtp,
+  sendWhatsAppText,
+  verifyOtpHash,
+} from "./whatsapp.mjs";
+
+export async function jsonTable(pool, tableName) {
+  const result = await pool.query("SELECT data FROM app_records WHERE table_name = $1", [tableName]).catch(() => ({ rows: [] }));
+  return result.rows.map((row) => ({ ...(row.data || {}), id: String(row.data?.id || row.id || "") }));
+}
+
+export async function jsonUpsert(pool, tableName, data) {
+  const id = String(data.id || crypto.randomUUID());
+  const now = new Date().toISOString();
+  const row = { ...data, id, updated_at: now };
+  if (!row.created_at) row.created_at = now;
+  await pool.query(
+    `INSERT INTO app_records (id, table_name, data, updated_at)
+     VALUES ($1, $2, $3::jsonb, now())
+     ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, updated_at = now()`,
+    [id, tableName, JSON.stringify(row)],
+  );
+  return row;
+}
+
+export async function resolveSessionUser(pool, token, verifyJwt) {
+  if (!token) return null;
+  if (verifyJwt) {
+    const claims = await verifyJwt(token);
+    if (claims?.id) {
+      const role = claims.role || (await roleForUser(pool, claims.id));
+      return { id: String(claims.id), email: claims.email || "", role };
+    }
+  }
+  const session = await pool.query(
+    `SELECT s.user_id, u.email
+     FROM auth_sessions s
+     JOIN auth_users u ON u.id = s.user_id
+     WHERE s.token = $1 AND s.expires_at > now()`,
+    [token],
+  ).catch(() => ({ rows: [] }));
+  if (session.rows[0]) {
+    const userId = String(session.rows[0].user_id);
+    return { id: userId, email: session.rows[0].email || "", role: await roleForUser(pool, userId) };
+  }
+  return null;
+}
+
+async function roleForUser(pool, userId) {
+  const result = await pool.query(
+    "SELECT data FROM app_records WHERE table_name = 'user_roles' AND data->>'user_id' = $1 LIMIT 1",
+    [String(userId)],
+  ).catch(() => ({ rows: [] }));
+  return result.rows[0]?.data?.role || "student";
+}
+
+export async function getProfile(pool, userId) {
+  const profiles = await jsonTable(pool, "profiles");
+  return profiles.find((row) => String(row.user_id) === String(userId)) || null;
+}
+
+export async function updateProfileWhatsApp(pool, userId, patch) {
+  const profiles = await jsonTable(pool, "profiles");
+  const existing = profiles.find((row) => String(row.user_id) === String(userId));
+  const next = {
+    ...(existing || { id: `profile-${userId}`, user_id: userId, created_at: new Date().toISOString() }),
+    ...patch,
+    updated_at: new Date().toISOString(),
+  };
+  await jsonUpsert(pool, "profiles", next);
+  return next;
+}
+
+export async function getVerificationStatus(pool, userId) {
+  const profile = await getProfile(pool, userId);
+  return {
+    verified: Boolean(profile?.whatsapp_verified),
+    phone: profile?.whatsapp_number || profile?.phone || "",
+    verifiedAt: profile?.whatsapp_verified_at || null,
+  };
+}
+
+function phoneMessage(value) {
+  const digits = String(value || "").replace(/\D/g, "");
+  const normalized = digits.length === 10 ? digits : digits.startsWith("91") && digits.length === 12 ? digits.slice(2) : digits;
+  if (!normalized) return "Enter your phone number";
+  if (normalized.length !== 10) return "Enter a 10-digit phone number";
+  return "";
+}
+
+function phoneDigits(value) {
+  const normalized = normalizePhone(value);
+  return normalized.startsWith("91") && normalized.length === 12 ? normalized.slice(2) : normalized;
+}
+
+export async function sendOtpForUser(pool, userId, phoneInput) {
+  const issue = phoneMessage(phoneInput);
+  if (issue) return { error: issue, status: 400 };
+  const phone = normalizePhone(phoneInput);
+
+  const rows = await jsonTable(pool, "whatsapp_verifications");
+  const recent = rows
+    .filter((row) => String(row.user_id) === String(userId) && String(row.phone_number) === phone)
+    .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))[0];
+  if (recent?.created_at) {
+    const elapsed = (Date.now() - Date.parse(recent.created_at)) / 1000;
+    if (elapsed < OTP_RESEND_SECONDS) {
+      return { error: `Please wait ${Math.ceil(OTP_RESEND_SECONDS - elapsed)} seconds before requesting another code.`, status: 429 };
+    }
+  }
+
+  const code = generateOtp();
+  const sent = await sendWhatsAppOtp(phone, code);
+  if (!sent.ok && !sent.dev) return { error: sent.error || "Could not send WhatsApp code.", status: 502 };
+
+  await jsonUpsert(pool, "whatsapp_verifications", {
+    id: crypto.randomUUID(),
+    user_id: String(userId),
+    phone_number: phone,
+    code_hash: hashOtp(code),
+    attempts: 0,
+    expires_at: otpExpiryDate(),
+    verified_at: null,
+    created_at: new Date().toISOString(),
+  });
+
+  return {
+    ok: true,
+    message: "Verification code sent to your WhatsApp.",
+    devHint: sent.dev ? `WhatsApp not configured — code: ${code}` : undefined,
+  };
+}
+
+export async function verifyOtpForUser(pool, userId, phoneInput, codeInput) {
+  const code = String(codeInput || "").trim();
+  if (!/^\d{6}$/.test(code)) return { error: "Enter the 6-digit code.", status: 400 };
+  const phone = normalizePhone(phoneInput);
+  const rows = await jsonTable(pool, "whatsapp_verifications");
+  const pending = rows
+    .filter((row) => String(row.user_id) === String(userId) && String(row.phone_number) === phone && !row.verified_at)
+    .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))[0];
+  if (!pending) return { error: "No active verification code. Request a new one.", status: 400 };
+  if (Date.parse(pending.expires_at) < Date.now()) return { error: "Code expired. Request a new one.", status: 400 };
+  if (Number(pending.attempts || 0) >= OTP_MAX_ATTEMPTS) return { error: "Too many attempts. Request a new code.", status: 429 };
+  if (!verifyOtpHash(code, pending.code_hash)) {
+    await jsonUpsert(pool, "whatsapp_verifications", { ...pending, attempts: Number(pending.attempts || 0) + 1 });
+    return { error: "Incorrect code.", status: 400 };
+  }
+
+  const now = new Date().toISOString();
+  await jsonUpsert(pool, "whatsapp_verifications", { ...pending, verified_at: now, attempts: Number(pending.attempts || 0) + 1 });
+  await updateProfileWhatsApp(pool, userId, {
+    whatsapp_number: phone,
+    whatsapp_verified: true,
+    whatsapp_verified_at: now,
+    phone: phoneDigits(phoneInput),
+  });
+
+  const leads = await jsonTable(pool, "student_leads");
+  for (const lead of leads.filter((row) => String(row.user_id) === String(userId))) {
+    await jsonUpsert(pool, "student_leads", {
+      ...lead,
+      phone: phoneDigits(phoneInput),
+      whatsapp_number: phone,
+      whatsapp_verified: true,
+    });
+  }
+
+  return { ok: true, verified: true, phone: phoneDigits(phoneInput) };
+}
+
+export async function findLeadForUser(pool, userId) {
+  const leads = await jsonTable(pool, "student_leads");
+  return leads.find((row) => String(row.user_id) === String(userId) || String(row.id) === String(userId)) || null;
+}
+
+export async function ensureWhatsAppConversation(pool, { userId, phone, staffId, staffRole, leadId }) {
+  const rows = await jsonTable(pool, "whatsapp_conversations");
+  const existing = rows.find(
+    (row) =>
+      String(row.user_id) === String(userId) ||
+      (phone && String(row.phone_number) === String(phone)) ||
+      (leadId && String(row.lead_id) === String(leadId)),
+  );
+  if (existing) {
+    const next = {
+      ...existing,
+      user_id: String(userId || existing.user_id || ""),
+      phone_number: phone || existing.phone_number,
+      assigned_staff_id: staffId || existing.assigned_staff_id,
+      staff_role: staffRole || existing.staff_role,
+      lead_id: leadId || existing.lead_id,
+    };
+    if (
+      next.user_id !== existing.user_id ||
+      next.phone_number !== existing.phone_number ||
+      next.assigned_staff_id !== existing.assigned_staff_id
+    ) {
+      await jsonUpsert(pool, "whatsapp_conversations", next);
+    }
+    return next;
+  }
+  return jsonUpsert(pool, "whatsapp_conversations", {
+    id: crypto.randomUUID(),
+    user_id: String(userId || ""),
+    lead_id: leadId || null,
+    phone_number: phone || "",
+    assigned_staff_id: staffId || null,
+    staff_role: staffRole || null,
+    last_message_at: null,
+    created_at: new Date().toISOString(),
+  });
+}
+
+export async function listWhatsAppConversations(pool, filterFn) {
+  const rows = await jsonTable(pool, "whatsapp_conversations");
+  return rows
+    .filter((row) => (filterFn ? filterFn(row) : true))
+    .sort((a, b) => String(b.last_message_at || b.created_at || "").localeCompare(String(a.last_message_at || a.created_at || "")));
+}
+
+export async function listWhatsAppMessages(pool, conversationId) {
+  const rows = await jsonTable(pool, "whatsapp_messages");
+  return rows
+    .filter((row) => String(row.conversation_id) === String(conversationId))
+    .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
+}
+
+export async function appendWhatsAppMessage(pool, {
+  conversationId,
+  direction,
+  body,
+  senderId,
+  senderType,
+  channel = "whatsapp",
+  waMessageId = null,
+  status = "sent",
+}) {
+  const now = new Date().toISOString();
+  const message = await jsonUpsert(pool, "whatsapp_messages", {
+    id: crypto.randomUUID(),
+    conversation_id: String(conversationId),
+    direction,
+    body,
+    sender_id: senderId || null,
+    sender_type: senderType || (direction === "inbound" ? "student" : "staff"),
+    channel,
+    wa_message_id: waMessageId,
+    delivery_status: status,
+    is_read: direction === "outbound",
+    created_at: now,
+  });
+
+  const conversations = await jsonTable(pool, "whatsapp_conversations");
+  const conversation = conversations.find((row) => String(row.id) === String(conversationId));
+  if (conversation) {
+    await jsonUpsert(pool, "whatsapp_conversations", { ...conversation, last_message_at: now });
+  }
+  return message;
+}
+
+export async function sendStaffWhatsAppReply(pool, { conversationId, staffId, body, notify }) {
+  const conversations = await jsonTable(pool, "whatsapp_conversations");
+  const conversation = conversations.find((row) => String(row.id) === String(conversationId));
+  if (!conversation) return { error: "Conversation not found.", status: 404 };
+  const text = String(body || "").trim();
+  if (!text) return { error: "Message cannot be empty.", status: 400 };
+
+  const sent = await sendWhatsAppText(conversation.phone_number, text);
+  const message = await appendWhatsAppMessage(pool, {
+    conversationId,
+    direction: "outbound",
+    body: text,
+    senderId: staffId,
+    senderType: "staff",
+    channel: "whatsapp",
+    waMessageId: sent.waMessageId || null,
+    status: sent.ok ? "sent" : "failed",
+  });
+
+  if (notify && conversation.user_id) {
+    await notify(conversation.user_id, "New WhatsApp message", text.slice(0, 140), "info", "/student/chat");
+  }
+  return { ok: true, message, dev: sent.dev };
+}
+
+export async function handleIncomingWhatsApp(pool, { from, body, waMessageId, notify }) {
+  const phone = normalizePhone(from);
+  const profiles = await jsonTable(pool, "profiles");
+  const profile = profiles.find((row) => normalizePhone(row.whatsapp_number || row.phone || "") === phone);
+  const leads = await jsonTable(pool, "student_leads");
+  const lead =
+    leads.find((row) => normalizePhone(row.whatsapp_number || row.phone || "") === phone) ||
+    (profile ? leads.find((row) => String(row.user_id) === String(profile.user_id)) : null);
+
+  const userId = profile?.user_id || lead?.user_id || "";
+  const staffId = lead?.assigned_counselor_id || lead?.assigned_telecaller_id || null;
+  const staffRole = lead?.assigned_counselor_id ? "counselor" : lead?.assigned_telecaller_id ? "telecaller" : null;
+
+  const conversation = await ensureWhatsAppConversation(pool, {
+    userId,
+    phone,
+    staffId,
+    staffRole,
+    leadId: lead?.id || null,
+  });
+
+  const message = await appendWhatsAppMessage(pool, {
+    conversationId: conversation.id,
+    direction: "inbound",
+    body,
+    senderId: userId || phone,
+    senderType: "student",
+    channel: "whatsapp",
+    waMessageId,
+    status: "received",
+  });
+
+  if (notify && staffId) {
+    const name = [lead?.first_name, lead?.last_name].filter(Boolean).join(" ") || "A student";
+    await notify(staffId, `WhatsApp from ${name}`, body.slice(0, 140), "info", staffRole === "counselor" ? "/counselor/whatsapp" : "/admin/telecallers");
+  }
+
+  return { conversation, message };
+}
+
+export async function updateMessageStatus(pool, waMessageId, status) {
+  const rows = await jsonTable(pool, "whatsapp_messages");
+  const message = rows.find((row) => String(row.wa_message_id) === String(waMessageId));
+  if (!message) return null;
+  return jsonUpsert(pool, "whatsapp_messages", { ...message, delivery_status: status });
+}

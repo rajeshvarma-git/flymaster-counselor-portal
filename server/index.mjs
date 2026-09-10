@@ -8,7 +8,7 @@ import { fileURLToPath } from "url";
 import { randomBytes, scryptSync, timingSafeEqual } from "crypto";
 import pg from "pg";
 import { sendVerificationEmail } from "./email.mjs";
-import { mountWhatsAppRoutes } from "../../shared/whatsappRoutes.mjs";
+import { mountWhatsAppRoutes } from "./whatsappRoutes.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, "..");
