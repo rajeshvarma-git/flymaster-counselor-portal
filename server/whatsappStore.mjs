@@ -230,21 +230,26 @@ export function leadAssignedToTelecaller(lead, staffId) {
   return Boolean(lead && staffId && String(lead.assigned_telecaller_id || "") === String(staffId));
 }
 
-export function counselorCanReply({ lead, aliases, portalCounselorId = null }) {
-  if (!aliases?.size || !lead) return false;
-  return leadOwnedByCounselor(lead, aliases, portalCounselorId);
+export function counselorCanReply({ lead, conversation, aliases, portalCounselorId = null }) {
+  if (!aliases?.size) return false;
+  if (lead && leadOwnedByCounselor(lead, aliases, portalCounselorId)) return true;
+  if (conversation && idInAliases(conversation.assigned_counselor_id, aliases)) return true;
+  return false;
 }
 
-export function canStaffReply({ staffRole, staffId, lead, aliases = null }) {
+export function canStaffReply({ staffRole, staffId, lead, aliases = null, conversation = null }) {
   if (staffRole === "admin" || staffRole === "super_admin") return true;
-  if (!lead || !staffId) return false;
-  const converted = isConvertedStudent(lead);
+  if (!staffId) return false;
+  const converted = lead ? isConvertedStudent(lead) : conversation?.stage === "student";
   if (staffRole === "telecaller") {
-    return !converted && leadAssignedToTelecaller(lead, staffId);
+    if (converted) return false;
+    if (lead && leadAssignedToTelecaller(lead, staffId)) return true;
+    return String(conversation?.assigned_telecaller_id || "") === String(staffId);
   }
   if (staffRole === "counselor") {
-    if (aliases?.size) return counselorCanReply({ lead, aliases, portalCounselorId: staffId });
-    return String(lead.assigned_counselor_id || "") === String(staffId);
+    if (aliases?.size) return counselorCanReply({ lead, conversation, aliases, portalCounselorId: staffId });
+    const assigned = String(lead?.assigned_counselor_id || conversation?.assigned_counselor_id || "");
+    return assigned === String(staffId);
   }
   return false;
 }
@@ -399,13 +404,14 @@ export async function ensureCounselorWhatsAppThreads(pool, aliases, portalCounse
     }
     const { telecallerId, stage } = resolveConversationParticipants(lead);
     const { handlerId, handlerRole } = resolveActiveHandler(lead);
+    const assignedCounselor = lead.assigned_counselor_id ? String(lead.assigned_counselor_id) : portalId;
     await ensureWhatsAppConversation(pool, {
       userId: lead.user_id || "",
       phone,
       leadId: lead.id,
       stage,
       telecallerId,
-      counselorId: portalId,
+      counselorId: idInAliases(assignedCounselor, aliases) ? portalId : assignedCounselor,
       activeHandlerId: handlerId,
       activeHandlerRole: handlerRole,
     });
@@ -482,7 +488,7 @@ export async function enrichWhatsAppConversations(pool, conversations, leads, { 
       unread_count: unread,
       stage: row.stage || (converted ? "student" : "lead"),
       lead_source: lead?.lead_source || null,
-      canReply: canStaffReply({ staffRole, staffId, lead, aliases }),
+      canReply: canStaffReply({ staffRole, staffId, lead, aliases, conversation: row }),
       assigned_telecaller_id: row.assigned_telecaller_id || lead?.assigned_telecaller_id || null,
       assigned_counselor_id: row.assigned_counselor_id || lead?.assigned_counselor_id || null,
     };
@@ -683,7 +689,12 @@ export async function sendStaffWhatsAppReply(pool, { conversationId, staffId, bo
   const leads = await loadAllLeads(pool);
   const lead = findLeadForConversation(conversation, leads);
   if (!canStaffReply({ staffRole, staffId, lead, aliases, conversation })) {
-    return { error: "You cannot reply to this thread at the current stage.", status: 403 };
+    return {
+      error: staffRole === "counselor"
+        ? "You cannot reply to this thread. Confirm this lead is assigned to you in My Leads."
+        : "You cannot reply to this thread at the current stage.",
+      status: 403,
+    };
   }
   const { telecallerId, counselorId, stage } = resolveConversationParticipants(lead || {});
   conversation = await jsonUpsert(pool, "whatsapp_conversations", {

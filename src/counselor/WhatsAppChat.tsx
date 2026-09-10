@@ -383,15 +383,16 @@ export default function WhatsAppChat({ mode }: WhatsAppChatProps) {
               </div>
               <div className="mt-4 flex gap-2 border-t border-slate-100 pt-4">
                 <input
-                  className="flex-1 rounded-xl border border-slate-200 px-3 py-2 text-sm"
+                  className="flex-1 rounded-xl border border-slate-200 px-3 py-2 text-sm disabled:bg-slate-50"
                   value={draft}
                   onChange={(e) => setDraft(e.target.value)}
-                  placeholder="Reply on WhatsApp..."
+                  placeholder={selected.canReply === false ? "You cannot reply on this thread" : "Reply on WhatsApp..."}
+                  disabled={selected.canReply === false}
                   onKeyDown={(e) => {
                     if (e.key === "Enter") void send();
                   }}
                 />
-                <Button onClick={() => void send()} disabled={sending || !draft.trim()}>
+                <Button onClick={() => void send()} disabled={sending || !draft.trim() || selected.canReply === false}>
                   <Send className="h-4 w-4" />
                 </Button>
               </div>

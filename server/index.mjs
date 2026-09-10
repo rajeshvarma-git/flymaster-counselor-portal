@@ -370,27 +370,27 @@ async function resolveCounselorAliases(portalCounselorId) {
   const found = await pool.query("SELECT id, email FROM counselor_users WHERE id = $1", [portalCounselorId]).catch(() => ({ rows: [] }));
   const email = String(found.rows[0]?.email || "").trim().toLowerCase();
   if (email) {
-    const auth = await pool.query("SELECT id FROM auth_users WHERE lower(email) = $1", [email]).catch(() => ({ rows: [] }));
-    const authId = auth.rows[0]?.id ? String(auth.rows[0].id) : "";
-    if (authId) {
-      aliases.add(authId);
-      aliases.add(`counselor-${authId}`);
+    const auth = await pool.query("SELECT id, email FROM auth_users WHERE lower(email) = $1", [email]).catch(() => ({ rows: [] }));
+    for (const row of auth.rows) {
+      if (row.id) {
+        aliases.add(String(row.id));
+        aliases.add(`counselor-${row.id}`);
+      }
     }
     const roles = await jsonTable("user_roles").catch(() => []);
     for (const role of roles.filter((row) => row.role === "counselor")) {
-      const authRow = auth.rows.find((item) => String(item.id) === String(role.user_id));
-      if (authRow && String(authRow.email || "").trim().toLowerCase() === email) {
-        aliases.add(String(role.user_id));
-      }
+      aliases.add(String(role.user_id));
     }
     const counselors = await jsonTable("counselors").catch(() => []);
     for (const row of counselors) {
+      const rowEmail = String(row.email || "").trim().toLowerCase();
       const rowUserId = String(row.user_id || "");
       const rowId = String(row.id || "");
       const authMatch = auth.rows.some((item) => String(item.id) === rowUserId);
-      if (authMatch || rowUserId === authId || rowUserId === String(portalCounselorId)) {
+      if (rowEmail === email || authMatch || rowUserId === String(portalCounselorId)) {
         if (rowId) aliases.add(rowId);
         if (rowUserId) aliases.add(rowUserId);
+        if (row.auth_user_id) aliases.add(String(row.auth_user_id));
       }
     }
     const sqlCounselors = await pool.query("SELECT id FROM counselor_users WHERE lower(email) = $1", [email]).catch(() => ({ rows: [] }));
