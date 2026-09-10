@@ -22,6 +22,8 @@ interface WhatsAppConversation {
   stage?: string;
   lead_source?: string | null;
   canReply?: boolean;
+  assigned_telecaller_id?: string | null;
+  assigned_counselor_id?: string | null;
 }
 
 interface WhatsAppMessage {
@@ -212,6 +214,16 @@ export default function WhatsAppChat({ mode }: WhatsAppChatProps) {
   const unknownCount = conversations.filter((item) => item.is_unknown).length;
   const whatsappReady = status?.credentialsValid && status?.webhookReady;
 
+  const visibleMessages = useMemo(() => {
+    return messages.filter((item, index) => {
+      const system = item.channel === "system" || item.kind === "system";
+      if (!system) return true;
+      const prev = messages[index - 1];
+      if (!prev) return true;
+      return !((prev.channel === "system" || prev.kind === "system") && prev.body === item.body);
+    });
+  }, [messages]);
+
   return (
     <div>
       <div className="mb-6 flex items-center gap-3">
@@ -323,6 +335,11 @@ export default function WhatsAppChat({ mode }: WhatsAppChatProps) {
                     {unknownCount > 1 ? ` ${unknownCount} unlinked chats on this page.` : ""}
                   </p>
                 )}
+                {mode === "lead" && selected.assigned_telecaller_id && (
+                  <p className="mt-2 text-xs text-slate-500">
+                    Telecaller and counselor are both active on this open lead — either can reply within the WhatsApp window.
+                  </p>
+                )}
                 {windowStatus && !windowStatus.open && (
                   <p className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
                     {windowStatus.reason}
@@ -330,7 +347,7 @@ export default function WhatsAppChat({ mode }: WhatsAppChatProps) {
                 )}
               </div>
               <div className="min-h-0 flex-1 overflow-y-auto">
-                {messages.map((item) => {
+                {visibleMessages.map((item) => {
                   const system = item.channel === "system" || item.kind === "system";
                   if (system) {
                     return (

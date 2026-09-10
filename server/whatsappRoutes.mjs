@@ -3,8 +3,10 @@ import {
   appendWhatsAppMessage,
   canStaffReply,
   conversationVisibleToCounselor,
+  conversationVisibleToTelecaller,
   computeCounselorWhatsAppMeta,
   ensureCounselorWhatsAppThreads,
+  ensureTelecallerWhatsAppThreads,
   ensureWhatsAppConversation,
   enrichWhatsAppConversations,
   findLeadForConversation,
@@ -191,19 +193,19 @@ export function mountWhatsAppRoutes(app, {
           provisioned: syncResult.provisioned,
           skippedNoPhone: syncResult.skippedNoPhone,
         };
+      } else if (role === "telecaller") {
+        await ensureTelecallerWhatsAppThreads(pool, req.user.id);
       }
       const conversations = await listWhatsAppConversations(pool, (row) => {
         if (role === "admin" || role === "super_admin") return true;
         if (role === "counselor") return conversationVisibleToCounselor(row, aliases, leads);
-        if (role === "telecaller") {
-          const lead = leads.find((item) => String(item.user_id) === String(row.user_id) || String(item.id) === String(row.lead_id));
-          return String(lead?.assigned_telecaller_id || row.active_handler_id || row.assigned_staff_id || "") === String(req.user.id);
-        }
+        if (role === "telecaller") return conversationVisibleToTelecaller(row, req.user.id, leads);
         return false;
       });
       let enriched = await enrichWhatsAppConversations(pool, conversations, leads, {
         aliases,
         staffRole: role,
+        staffId: req.user.id,
       });
       if (stageFilter === "lead" || stageFilter === "student") {
         enriched = enriched.filter((row) => {

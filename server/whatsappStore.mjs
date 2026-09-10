@@ -194,54 +194,57 @@ export async function findLeadByPhone(pool, phone) {
   return leads.find((row) => normalizePhone(row.whatsapp_number || row.phone || "") === normalized) || null;
 }
 
+export function resolveConversationParticipants(lead) {
+  if (!lead) return { telecallerId: null, counselorId: null, stage: "lead" };
+  const converted = isConvertedStudent(lead);
+  return {
+    telecallerId: lead.assigned_telecaller_id ? String(lead.assigned_telecaller_id) : null,
+    counselorId: lead.assigned_counselor_id ? String(lead.assigned_counselor_id) : null,
+    stage: converted ? "student" : "lead",
+  };
+}
+
+function participantSyncKey(lead) {
+  const { telecallerId, counselorId, stage } = resolveConversationParticipants(lead);
+  return `${telecallerId || ""}|${counselorId || ""}|${stage}`;
+}
+
+/** Primary handler for routing/notifications — both staff can still reply when assigned. */
 export function resolveActiveHandler(lead) {
   if (!lead) return { handlerId: null, handlerRole: null, stage: "lead" };
-  const converted = isConvertedStudent(lead);
-  const stage = converted ? "student" : "lead";
-  if (lead.assigned_counselor_id) {
-    return { handlerId: String(lead.assigned_counselor_id), handlerRole: "counselor", stage };
+  const { telecallerId, counselorId, stage } = resolveConversationParticipants(lead);
+  const converted = stage === "student";
+  if (converted && counselorId) {
+    return { handlerId: counselorId, handlerRole: "counselor", stage };
   }
-  if (!converted && lead.assigned_telecaller_id) {
-    return { handlerId: String(lead.assigned_telecaller_id), handlerRole: "telecaller", stage };
+  if (!converted && telecallerId) {
+    return { handlerId: telecallerId, handlerRole: "telecaller", stage };
+  }
+  if (counselorId) {
+    return { handlerId: counselorId, handlerRole: "counselor", stage };
   }
   return { handlerId: null, handlerRole: null, stage };
 }
 
-export function counselorCanReply({ lead, conversation, aliases }) {
-  if (!aliases?.size) return false;
-  const converted = isConvertedStudent(lead);
-
-  if (lead && leadOwnedByCounselor(lead, aliases)) {
-    return true;
-  }
-
-  if (conversation) {
-    if (idInAliases(conversation.active_handler_id, aliases)) {
-      if (conversation.active_handler_role === "telecaller" && converted) return false;
-      return conversation.active_handler_role !== "telecaller";
-    }
-    if (idInAliases(conversation.assigned_staff_id, aliases) && conversation.staff_role !== "telecaller") {
-      return true;
-    }
-  }
-
-  return false;
+export function leadAssignedToTelecaller(lead, staffId) {
+  return Boolean(lead && staffId && String(lead.assigned_telecaller_id || "") === String(staffId));
 }
 
-export function canStaffReply({ staffRole, staffId, lead, aliases = null, conversation = null }) {
+export function counselorCanReply({ lead, aliases, portalCounselorId = null }) {
+  if (!aliases?.size || !lead) return false;
+  return leadOwnedByCounselor(lead, aliases, portalCounselorId);
+}
+
+export function canStaffReply({ staffRole, staffId, lead, aliases = null }) {
   if (staffRole === "admin" || staffRole === "super_admin") return true;
+  if (!lead || !staffId) return false;
+  const converted = isConvertedStudent(lead);
   if (staffRole === "telecaller") {
-    if (!lead) return false;
-    const converted = isConvertedStudent(lead);
-    return !converted && String(lead.assigned_telecaller_id || "") === String(staffId);
+    return !converted && leadAssignedToTelecaller(lead, staffId);
   }
   if (staffRole === "counselor") {
-    if (aliases?.size) return counselorCanReply({ lead, conversation, aliases });
-    if (lead) return String(lead.assigned_counselor_id || "") === String(staffId);
-    if (conversation) {
-      return String(conversation.active_handler_id || conversation.assigned_staff_id || "") === String(staffId);
-    }
-    return false;
+    if (aliases?.size) return counselorCanReply({ lead, aliases, portalCounselorId: staffId });
+    return String(lead.assigned_counselor_id || "") === String(staffId);
   }
   return false;
 }
@@ -301,42 +304,35 @@ export async function createWhatsAppLead(pool, phone, previewMessage = "") {
   return lead;
 }
 
-export async function syncConversationFromLead(pool, lead, businessPhoneId = null) {
+export async function syncConversationFromLead(pool, lead, options = {}) {
   if (!lead?.id) return null;
+  const { businessPhoneId = null, recordHandoff = false, previousLead = null } = options;
   const phone = normalizePhone(lead.whatsapp_number || lead.phone || "");
-  const { handlerId, handlerRole, stage } = resolveActiveHandler(lead);
-  return ensureWhatsAppConversation(pool, {
+  const { telecallerId, counselorId, stage } = resolveConversationParticipants(lead);
+  const { handlerId, handlerRole } = resolveActiveHandler(lead);
+  const conversation = await ensureWhatsAppConversation(pool, {
     userId: lead.user_id || "",
     phone,
-    staffId: handlerId,
-    staffRole: handlerRole,
     leadId: lead.id,
     businessPhoneId,
     stage,
+    telecallerId,
+    counselorId,
     activeHandlerId: handlerId,
     activeHandlerRole: handlerRole,
   });
+  if (recordHandoff && previousLead && conversation) {
+    await recordParticipantHandoff(pool, conversation, previousLead, lead);
+  }
+  return conversation;
 }
 
 export async function handoffOnConversion(pool, leadId) {
-  const leads = await jsonTable(pool, "student_leads");
+  const leads = await loadAllLeads(pool);
   const lead = leads.find((row) => String(row.id) === String(leadId));
-  if (!lead) return null;
-  const conversations = await jsonTable(pool, "whatsapp_conversations");
-  const conversation = conversations.find(
-    (row) => String(row.lead_id) === String(leadId) || normalizePhone(row.phone_number) === normalizePhone(lead.whatsapp_number || lead.phone || ""),
-  );
-  if (!conversation) return syncConversationFromLead(pool, lead);
-  const next = {
-    ...conversation,
-    stage: "student",
-    active_handler_id: lead.assigned_counselor_id || null,
-    active_handler_role: lead.assigned_counselor_id ? "counselor" : null,
-    assigned_staff_id: lead.assigned_counselor_id || null,
-    staff_role: lead.assigned_counselor_id ? "counselor" : null,
-  };
-  await jsonUpsert(pool, "whatsapp_conversations", next);
-  return next;
+  if (!lead || !isConvertedStudent(lead)) return null;
+  const previousLead = { ...lead, entity_type: "lead", lead_status: "hot" };
+  return syncConversationFromLead(pool, lead, { recordHandoff: true, previousLead });
 }
 
 export function findLeadForConversation(conversation, leads) {
@@ -372,11 +368,16 @@ export function leadOwnedByCounselor(lead, aliases, portalCounselorId = null) {
 
 export function conversationVisibleToCounselor(conversation, aliases, leads) {
   if (!conversation || !aliases?.size) return false;
-  if (idInAliases(conversation.assigned_staff_id, aliases)) return true;
-  if (idInAliases(conversation.active_handler_id, aliases)) return true;
+  if (idInAliases(conversation.assigned_counselor_id, aliases)) return true;
   const lead = findLeadForConversation(conversation, leads);
-  if (leadOwnedByCounselor(lead, aliases)) return true;
-  return false;
+  return leadOwnedByCounselor(lead, aliases);
+}
+
+export function conversationVisibleToTelecaller(conversation, staffId, leads) {
+  if (!conversation || !staffId) return false;
+  if (String(conversation.assigned_telecaller_id || "") === String(staffId)) return true;
+  const lead = findLeadForConversation(conversation, leads);
+  return leadAssignedToTelecaller(lead, staffId);
 }
 
 export async function ensureCounselorWhatsAppThreads(pool, aliases, portalCounselorId = null) {
@@ -396,16 +397,46 @@ export async function ensureCounselorWhatsAppThreads(pool, aliases, portalCounse
       skippedNoPhone += 1;
       continue;
     }
-    const converted = isConvertedStudent(lead);
+    const { telecallerId, stage } = resolveConversationParticipants(lead);
+    const { handlerId, handlerRole } = resolveActiveHandler(lead);
     await ensureWhatsAppConversation(pool, {
       userId: lead.user_id || "",
       phone,
       leadId: lead.id,
-      stage: converted ? "student" : "lead",
-      staffId: portalId,
-      staffRole: "counselor",
-      activeHandlerId: portalId,
-      activeHandlerRole: "counselor",
+      stage,
+      telecallerId,
+      counselorId: portalId,
+      activeHandlerId: handlerId,
+      activeHandlerRole: handlerRole,
+    });
+    provisioned += 1;
+  }
+  return { provisioned, skippedNoPhone };
+}
+
+export async function ensureTelecallerWhatsAppThreads(pool, telecallerId) {
+  if (!telecallerId) return { provisioned: 0, skippedNoPhone: 0 };
+  const leads = await loadAllLeads(pool);
+  let provisioned = 0;
+  let skippedNoPhone = 0;
+  for (const lead of leads) {
+    if (!leadAssignedToTelecaller(lead, telecallerId) || isConvertedStudent(lead)) continue;
+    const phone = normalizePhone(lead.whatsapp_number || lead.phone || "");
+    if (!phone || phone.length < 12) {
+      skippedNoPhone += 1;
+      continue;
+    }
+    const { telecallerId: tcId, counselorId, stage } = resolveConversationParticipants(lead);
+    const { handlerId, handlerRole } = resolveActiveHandler(lead);
+    await ensureWhatsAppConversation(pool, {
+      userId: lead.user_id || "",
+      phone,
+      leadId: lead.id,
+      stage,
+      telecallerId: tcId,
+      counselorId,
+      activeHandlerId: handlerId,
+      activeHandlerRole: handlerRole,
     });
     provisioned += 1;
   }
@@ -431,15 +462,16 @@ export function computeCounselorWhatsAppMeta(leads, aliases, portalCounselorId, 
   };
 }
 
-export async function enrichWhatsAppConversations(pool, conversations, leads, { aliases = null, staffRole = "counselor" } = {}) {
+export async function enrichWhatsAppConversations(pool, conversations, leads, { aliases = null, staffRole = "counselor", staffId = null } = {}) {
   const messages = await jsonTable(pool, "whatsapp_messages");
   return conversations.map((row) => {
     const lead = findLeadForConversation(row, leads);
     const convMessages = messages
       .filter((item) => String(item.conversation_id) === String(row.id))
       .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
-    const last = convMessages[convMessages.length - 1];
-    const unread = convMessages.filter((item) => item.direction === "inbound" && !item.is_read).length;
+    const chatMessages = convMessages.filter((item) => item.channel !== "system" && item.kind !== "system");
+    const last = chatMessages[chatMessages.length - 1];
+    const unread = chatMessages.filter((item) => item.direction === "inbound" && !item.is_read).length;
     const studentName = lead ? [lead.first_name, lead.last_name].filter(Boolean).join(" ").trim() : "";
     const converted = isConvertedStudent(lead);
     return {
@@ -450,19 +482,64 @@ export async function enrichWhatsAppConversations(pool, conversations, leads, { 
       unread_count: unread,
       stage: row.stage || (converted ? "student" : "lead"),
       lead_source: lead?.lead_source || null,
-      canReply: canStaffReply({ staffRole, staffId: null, lead, aliases, conversation: row }),
+      canReply: canStaffReply({ staffRole, staffId, lead, aliases }),
+      assigned_telecaller_id: row.assigned_telecaller_id || lead?.assigned_telecaller_id || null,
+      assigned_counselor_id: row.assigned_counselor_id || lead?.assigned_counselor_id || null,
     };
   });
+}
+
+export async function appendSystemMessage(pool, conversationId, body) {
+  return appendWhatsAppMessage(pool, {
+    conversationId,
+    direction: "inbound",
+    body,
+    senderId: null,
+    senderType: "system",
+    channel: "system",
+    status: "system",
+  });
+}
+
+export async function recordParticipantHandoff(pool, conversation, previousLead, nextLead) {
+  if (!conversation?.id || !nextLead) return conversation;
+  const nextKey = participantSyncKey(nextLead);
+  if (String(conversation.participant_sync_key || "") === nextKey) return conversation;
+
+  const prevTc = String(previousLead?.assigned_telecaller_id || "");
+  const nextTc = String(nextLead.assigned_telecaller_id || "");
+  const prevCo = String(previousLead?.assigned_counselor_id || "");
+  const nextCo = String(nextLead.assigned_counselor_id || "");
+  const wasConverted = isConvertedStudent(previousLead);
+  const isConverted = isConvertedStudent(nextLead);
+
+  const notes = [];
+  if (nextTc && nextTc !== prevTc) notes.push("A telecaller joined this chat.");
+  if (nextCo && nextCo !== prevCo) notes.push("A counselor joined this chat.");
+  if (isConverted && !wasConverted) notes.push("Lead converted — counselor now handles WhatsApp replies.");
+
+  for (const body of notes) {
+    await appendSystemMessage(pool, conversation.id, body);
+  }
+
+  const updated = {
+    ...conversation,
+    participant_sync_key: nextKey,
+    assigned_telecaller_id: nextTc || null,
+    assigned_counselor_id: nextCo || null,
+  };
+  await jsonUpsert(pool, "whatsapp_conversations", updated);
+  return updated;
 }
 
 export async function ensureWhatsAppConversation(pool, {
   userId,
   phone,
-  staffId,
-  staffRole,
   leadId,
   businessPhoneId,
   stage = null,
+  telecallerId = null,
+  counselorId = null,
   activeHandlerId = null,
   activeHandlerRole = null,
   lastMessagePreview = null,
@@ -475,18 +552,23 @@ export async function ensureWhatsAppConversation(pool, {
       (normalizedPhone && normalizePhone(row.phone_number || "") === normalizedPhone) ||
       (leadId && String(row.lead_id) === String(leadId)),
   );
-  const handlerId = activeHandlerId ?? staffId ?? existing?.active_handler_id ?? existing?.assigned_staff_id ?? null;
-  const handlerRole = activeHandlerRole ?? staffRole ?? existing?.active_handler_role ?? existing?.staff_role ?? null;
+  const nextTelecaller = telecallerId ?? existing?.assigned_telecaller_id ?? null;
+  const nextCounselor = counselorId ?? existing?.assigned_counselor_id ?? null;
+  const handlerId = activeHandlerId ?? existing?.active_handler_id ?? null;
+  const handlerRole = activeHandlerRole ?? existing?.active_handler_role ?? null;
+
   if (existing) {
     const next = {
       ...existing,
       user_id: String(userId || existing.user_id || ""),
       phone_number: normalizedPhone || normalizePhone(existing.phone_number || ""),
       lead_id: leadId || existing.lead_id,
-      assigned_staff_id: handlerId,
-      staff_role: handlerRole,
-      active_handler_id: handlerId,
-      active_handler_role: handlerRole,
+      assigned_telecaller_id: nextTelecaller,
+      assigned_counselor_id: nextCounselor,
+      assigned_staff_id: handlerId ?? existing.assigned_staff_id ?? null,
+      staff_role: handlerRole ?? existing.staff_role ?? null,
+      active_handler_id: handlerId ?? existing.active_handler_id ?? null,
+      active_handler_role: handlerRole ?? existing.active_handler_role ?? null,
       stage: stage || existing.stage || "lead",
       last_message_preview: lastMessagePreview ?? existing.last_message_preview ?? null,
       business_phone_id: businessPhoneId || existing.business_phone_id || null,
@@ -495,12 +577,15 @@ export async function ensureWhatsAppConversation(pool, {
     if (changed) await jsonUpsert(pool, "whatsapp_conversations", next);
     return next;
   }
+
   return jsonUpsert(pool, "whatsapp_conversations", {
     id: crypto.randomUUID(),
     user_id: String(userId || ""),
     lead_id: leadId || null,
     phone_number: normalizedPhone || "",
     business_phone_id: businessPhoneId || null,
+    assigned_telecaller_id: nextTelecaller,
+    assigned_counselor_id: nextCounselor,
     assigned_staff_id: handlerId,
     staff_role: handlerRole,
     active_handler_id: handlerId,
@@ -508,6 +593,7 @@ export async function ensureWhatsAppConversation(pool, {
     stage: stage || "lead",
     last_message_preview: lastMessagePreview,
     last_message_at: null,
+    participant_sync_key: null,
     created_at: new Date().toISOString(),
   });
 }
@@ -526,9 +612,13 @@ export async function listWhatsAppMessages(pool, conversationId) {
     .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
 }
 
+function isRealInboundMessage(row) {
+  return row.direction === "inbound" && row.channel !== "system" && row.kind !== "system";
+}
+
 export async function getMessagingWindowStatus(pool, conversationId) {
   const messages = await listWhatsAppMessages(pool, conversationId);
-  const inbound = messages.filter((row) => row.direction === "inbound");
+  const inbound = messages.filter(isRealInboundMessage);
   const lastInbound = inbound[inbound.length - 1];
   if (!lastInbound?.created_at) {
     return { open: false, reason: "The student has not messaged on WhatsApp yet. They must message your business number first." };
@@ -572,7 +662,8 @@ export async function appendWhatsAppMessage(pool, {
 
   const conversations = await jsonTable(pool, "whatsapp_conversations");
   const conversation = conversations.find((row) => String(row.id) === String(conversationId));
-  if (conversation) {
+  const isSystem = channel === "system";
+  if (conversation && !isSystem) {
     await jsonUpsert(pool, "whatsapp_conversations", {
       ...conversation,
       last_message_at: now,
@@ -594,13 +685,14 @@ export async function sendStaffWhatsAppReply(pool, { conversationId, staffId, bo
   if (!canStaffReply({ staffRole, staffId, lead, aliases, conversation })) {
     return { error: "You cannot reply to this thread at the current stage.", status: 403 };
   }
+  const { telecallerId, counselorId, stage } = resolveConversationParticipants(lead || {});
   conversation = await jsonUpsert(pool, "whatsapp_conversations", {
     ...conversation,
-    assigned_staff_id: staffId,
-    staff_role: staffRole,
-    active_handler_id: staffId,
-    active_handler_role: staffRole,
-    stage: isConvertedStudent(lead) ? "student" : (conversation.stage || "lead"),
+    assigned_telecaller_id: telecallerId || conversation.assigned_telecaller_id || null,
+    assigned_counselor_id: counselorId || conversation.assigned_counselor_id || null,
+    last_replied_by_id: staffId,
+    last_replied_by_role: staffRole,
+    stage: isConvertedStudent(lead) ? "student" : (stage || conversation.stage || "lead"),
     user_id: conversation.user_id || lead?.user_id || "",
     lead_id: conversation.lead_id || lead?.id || null,
   });
@@ -680,16 +772,17 @@ export async function handleIncomingWhatsApp(pool, { from, body, waMessageId, no
   }
 
   const userId = profile?.user_id || lead?.user_id || "";
-  const { handlerId, handlerRole, stage } = resolveActiveHandler(lead);
+  const { telecallerId, counselorId, stage } = resolveConversationParticipants(lead);
+  const { handlerId, handlerRole } = resolveActiveHandler(lead);
 
   const conversation = await ensureWhatsAppConversation(pool, {
     userId,
     phone,
-    staffId: handlerId,
-    staffRole: handlerRole,
     leadId: lead.id,
     businessPhoneId,
     stage,
+    telecallerId,
+    counselorId,
     activeHandlerId: handlerId,
     activeHandlerRole: handlerRole,
     lastMessagePreview: preview,
@@ -708,16 +801,21 @@ export async function handleIncomingWhatsApp(pool, { from, body, waMessageId, no
 
   const name = [lead.first_name, lead.last_name].filter(Boolean).join(" ") || phone;
   if (notify) {
-    if (handlerId) {
-      const counselorUrl = isConvertedStudent(lead) ? "/counselor/whatsapp/students" : "/counselor/whatsapp/leads";
-      const actionUrl =
-        handlerRole === "counselor"
-          ? counselorUrl
-          : handlerRole === "telecaller"
-            ? "/admin/inbox"
-            : "/admin/whatsapp";
+    const converted = isConvertedStudent(lead);
+    const counselorUrl = converted ? "/counselor/whatsapp/students" : "/counselor/whatsapp/leads";
+    const notified = new Set();
+    if (telecallerId && !converted) {
+      await notify(telecallerId, `WhatsApp from ${name}`, preview, "info", "/admin/inbox");
+      notified.add(String(telecallerId));
+    }
+    if (counselorId) {
+      await notify(counselorId, `WhatsApp from ${name}`, preview, "info", counselorUrl);
+      notified.add(String(counselorId));
+    }
+    if (!notified.size && handlerId) {
+      const actionUrl = handlerRole === "counselor" ? counselorUrl : handlerRole === "telecaller" ? "/admin/inbox" : "/admin/whatsapp";
       await notify(handlerId, `WhatsApp from ${name}`, preview, "info", actionUrl);
-    } else {
+    } else if (!notified.size) {
       await notifyAdmins(
         pool,
         notify,

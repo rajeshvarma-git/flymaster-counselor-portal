@@ -1338,7 +1338,7 @@ app.post("/api/leads/:id/claim", auth, async (req, res) => {
   const lead = jsonLeads.find((row) => String(row.id) === String(req.params.id));
   if (lead) {
     await jsonUpsert("student_leads", { ...lead, assigned_counselor_id: req.user.id, status: "assigned" });
-    await syncConversationFromLead(pool, { ...lead, assigned_counselor_id: req.user.id, status: "assigned" }).catch(() => {});
+    await syncConversationFromLead(pool, { ...lead, assigned_counselor_id: req.user.id, status: "assigned" }, { recordHandoff: true, previousLead: lead }).catch(() => {});
   }
   res.json({ ok: true });
 });
