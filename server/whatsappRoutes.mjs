@@ -1,7 +1,9 @@
 import { getWhatsAppConfig, parseIncomingWebhook } from "./whatsapp.mjs";
 import {
   appendWhatsAppMessage,
+  conversationVisibleToCounselor,
   ensureWhatsAppConversation,
+  enrichWhatsAppConversations,
   findLeadForUser,
   getVerificationStatus,
   handleIncomingWhatsApp,
@@ -126,17 +128,15 @@ export function mountWhatsAppRoutes(app, { pool, verifyJwt, notify, staffRoles =
       const leads = await jsonTable(pool, "student_leads");
       const conversations = await listWhatsAppConversations(pool, (row) => {
         if (role === "admin" || role === "super_admin") return true;
-        if (role === "counselor") {
-          const lead = leads.find((item) => String(item.user_id) === String(row.user_id) || String(item.id) === String(row.lead_id));
-          return String(lead?.assigned_counselor_id || row.assigned_staff_id || "") === String(req.user.id);
-        }
+        if (role === "counselor") return conversationVisibleToCounselor(row, req.user.id, leads);
         if (role === "telecaller") {
           const lead = leads.find((item) => String(item.user_id) === String(row.user_id) || String(item.id) === String(row.lead_id));
           return String(lead?.assigned_telecaller_id || row.assigned_staff_id || "") === String(req.user.id);
         }
         return false;
       });
-      res.json({ conversations });
+      const enriched = await enrichWhatsAppConversations(pool, conversations, leads);
+      res.json({ conversations: enriched });
     } catch (error) {
       res.status(500).json({ error: error.message || "Could not load conversations" });
     }
@@ -158,6 +158,7 @@ export function mountWhatsAppRoutes(app, { pool, verifyJwt, notify, staffRoles =
         staffId: req.user.id,
         body: req.body.message,
         notify,
+        staffRole: req.user.role === "telecaller" ? "telecaller" : "counselor",
       });
       if (result.error) return res.status(result.status || 400).json({ error: result.error });
       res.json(result);

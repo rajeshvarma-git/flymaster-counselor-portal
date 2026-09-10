@@ -181,6 +181,54 @@ export async function findLeadForUser(pool, userId) {
   return leads.find((row) => String(row.user_id) === String(userId) || String(row.id) === String(userId)) || null;
 }
 
+export function findLeadForConversation(conversation, leads) {
+  if (!conversation) return null;
+  const phone = normalizePhone(conversation.phone_number || "");
+  return (
+    leads.find(
+      (row) =>
+        String(row.user_id) === String(conversation.user_id) ||
+        String(row.id) === String(conversation.lead_id) ||
+        (phone && normalizePhone(row.whatsapp_number || row.phone || "") === phone),
+    ) || null
+  );
+}
+
+export function conversationVisibleToCounselor(conversation, counselorId, leads) {
+  const id = String(counselorId || "");
+  if (!id || !conversation) return false;
+  if (String(conversation.assigned_staff_id || "") === id) return true;
+
+  const lead = findLeadForConversation(conversation, leads);
+  if (String(lead?.assigned_counselor_id || "") === id) return true;
+
+  const phone = normalizePhone(conversation.phone_number || "");
+  if (phone && !conversation.user_id && !conversation.lead_id) {
+    return true;
+  }
+  return false;
+}
+
+export async function enrichWhatsAppConversations(pool, conversations, leads) {
+  const messages = await jsonTable(pool, "whatsapp_messages");
+  return conversations.map((row) => {
+    const lead = findLeadForConversation(row, leads);
+    const convMessages = messages
+      .filter((item) => String(item.conversation_id) === String(row.id))
+      .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
+    const last = convMessages[convMessages.length - 1];
+    const unread = convMessages.filter((item) => item.direction === "inbound" && !item.is_read).length;
+    const studentName = lead ? [lead.first_name, lead.last_name].filter(Boolean).join(" ").trim() : "";
+    return {
+      ...row,
+      student_name: studentName || null,
+      is_unknown: !row.user_id && !row.lead_id,
+      last_message: last?.body || null,
+      unread_count: unread,
+    };
+  });
+}
+
 export async function ensureWhatsAppConversation(pool, { userId, phone, staffId, staffRole, leadId }) {
   const rows = await jsonTable(pool, "whatsapp_conversations");
   const existing = rows.find(
@@ -266,12 +314,24 @@ export async function appendWhatsAppMessage(pool, {
   return message;
 }
 
-export async function sendStaffWhatsAppReply(pool, { conversationId, staffId, body, notify }) {
+export async function sendStaffWhatsAppReply(pool, { conversationId, staffId, body, notify, staffRole = "counselor" }) {
   const conversations = await jsonTable(pool, "whatsapp_conversations");
-  const conversation = conversations.find((row) => String(row.id) === String(conversationId));
+  let conversation = conversations.find((row) => String(row.id) === String(conversationId));
   if (!conversation) return { error: "Conversation not found.", status: 404 };
   const text = String(body || "").trim();
   if (!text) return { error: "Message cannot be empty.", status: 400 };
+
+  const leads = await jsonTable(pool, "student_leads");
+  const lead = findLeadForConversation(conversation, leads);
+  if (!conversation.assigned_staff_id && staffId) {
+    conversation = await jsonUpsert(pool, "whatsapp_conversations", {
+      ...conversation,
+      assigned_staff_id: staffId,
+      staff_role: staffRole,
+      user_id: conversation.user_id || lead?.user_id || "",
+      lead_id: conversation.lead_id || lead?.id || null,
+    });
+  }
 
   const sent = await sendWhatsAppText(conversation.phone_number, text);
   const message = await appendWhatsAppMessage(pool, {

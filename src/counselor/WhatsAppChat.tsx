@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { format } from "date-fns";
-import { MessageCircle, Send } from "lucide-react";
+import { AlertCircle, MessageCircle, Send } from "lucide-react";
 import { api } from "@/lib/api";
 import { useLocalStore } from "@/lib/store";
 import { displayName } from "@/lib/utils";
@@ -12,6 +12,10 @@ interface WhatsAppConversation {
   user_id: string;
   phone_number: string;
   last_message_at?: string | null;
+  student_name?: string | null;
+  is_unknown?: boolean;
+  last_message?: string | null;
+  unread_count?: number;
 }
 
 interface WhatsAppMessage {
@@ -24,6 +28,19 @@ interface WhatsAppMessage {
   created_at: string;
 }
 
+interface WhatsAppStatus {
+  ok: boolean;
+  webhookReady: boolean;
+  whatsappApiConfigured: boolean;
+}
+
+function formatPhone(phone: string) {
+  const digits = phone.replace(/\D/g, "");
+  if (digits.length === 12 && digits.startsWith("91")) return `+91 ${digits.slice(2, 7)} ${digits.slice(7)}`;
+  if (digits.length === 10) return `+91 ${digits.slice(0, 5)} ${digits.slice(5)}`;
+  return phone || "Unknown";
+}
+
 export default function WhatsAppChat() {
   const store = useLocalStore();
   const [conversations, setConversations] = useState<WhatsAppConversation[]>([]);
@@ -31,12 +48,25 @@ export default function WhatsAppChat() {
   const [messages, setMessages] = useState<WhatsAppMessage[]>([]);
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [status, setStatus] = useState<WhatsAppStatus | null>(null);
+
+  useEffect(() => {
+    void api<WhatsAppStatus>("/whatsapp/status", { auth: false })
+      .then(setStatus)
+      .catch(() => setStatus(null));
+  }, []);
 
   useEffect(() => {
     const load = () =>
       api<{ conversations: WhatsAppConversation[] }>("/whatsapp/conversations")
-        .then((data) => setConversations(data.conversations || []))
-        .catch(() => setConversations([]));
+        .then((data) => {
+          const next = data.conversations || [];
+          setConversations(next);
+          setSelectedId((current) => current || next[0]?.id || null);
+        })
+        .catch(() => setConversations([]))
+        .finally(() => setLoading(false));
     void load();
     const timer = window.setInterval(load, 5000);
     return () => window.clearInterval(timer);
@@ -52,15 +82,24 @@ export default function WhatsAppChat() {
       setMessages([]);
       return;
     }
-    void api<{ messages: WhatsAppMessage[] }>(`/whatsapp/conversations/${selected.id}/messages`).then((data) => {
-      setMessages(data.messages || []);
-      void api(`/whatsapp/conversations/${selected.id}/read`, { method: "POST" }).catch(() => {});
-    });
+    const loadMessages = () =>
+      api<{ messages: WhatsAppMessage[] }>(`/whatsapp/conversations/${selected.id}/messages`).then((data) => {
+        setMessages(data.messages || []);
+        void api(`/whatsapp/conversations/${selected.id}/read`, { method: "POST" }).catch(() => {});
+      });
+    void loadMessages();
+    const timer = window.setInterval(loadMessages, 5000);
+    return () => window.clearInterval(timer);
   }, [selected?.id]);
 
-  const studentLabel = (userId: string) => {
-    const lead = store.leads.find((item) => String(item.user_id) === String(userId) || String(item.id) === String(userId));
-    return lead ? displayName(lead.first_name, lead.last_name) : userId;
+  const studentLabel = (item: WhatsAppConversation) => {
+    if (item.student_name) return item.student_name;
+    const lead = store.leads.find(
+      (row) => String(row.user_id) === String(item.user_id) || String(row.id) === String(item.user_id),
+    );
+    if (lead) return displayName(lead.first_name, lead.last_name);
+    if (item.is_unknown || !item.user_id) return `WhatsApp ${formatPhone(item.phone_number)}`;
+    return item.phone_number ? formatPhone(item.phone_number) : "Unknown contact";
   };
 
   const send = async () => {
@@ -73,10 +112,20 @@ export default function WhatsAppChat() {
       });
       setMessages((prev) => [...prev, result.message]);
       setDraft("");
+      setConversations((prev) =>
+        prev.map((item) =>
+          item.id === selected.id
+            ? { ...item, last_message: draft.trim(), is_unknown: false, unread_count: 0 }
+            : item,
+        ),
+      );
     } finally {
       setSending(false);
     }
   };
+
+  const unknownCount = conversations.filter((item) => item.is_unknown).length;
+  const whatsappReady = status?.whatsappApiConfigured && status?.webhookReady;
 
   return (
     <div>
@@ -87,29 +136,80 @@ export default function WhatsAppChat() {
           <p className="text-slate-600">Reply to students on WhatsApp or see their in-app messages here.</p>
         </div>
       </div>
-      <div className="grid gap-4 lg:grid-cols-[240px_1fr]">
+
+      {status && !whatsappReady && (
+        <Card className="mb-4 flex items-start gap-3 border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">
+          <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+          <div>
+            <p className="font-medium">WhatsApp is not fully configured on the server.</p>
+            <p className="mt-1 text-amber-800">
+              Ask admin to set WHATSAPP_ACCESS_TOKEN, WHATSAPP_PHONE_NUMBER_ID, and WHATSAPP_WEBHOOK_VERIFY_TOKEN in
+              Railway, then point the Meta webhook to this app&apos;s /api/whatsapp/webhook URL.
+            </p>
+          </div>
+        </Card>
+      )}
+
+      <div className="grid gap-4 lg:grid-cols-[280px_1fr]">
         <Card className="max-h-[70vh] overflow-y-auto p-2">
+          {loading && conversations.length === 0 && <p className="p-4 text-sm text-slate-500">Loading conversations...</p>}
           {conversations.map((item) => (
             <button
               key={item.id}
               className={`w-full rounded-xl px-3 py-2 text-left text-sm ${selected?.id === item.id ? "bg-emerald-50" : "hover:bg-slate-50"}`}
               onClick={() => setSelectedId(item.id)}
             >
-              <p className="font-medium">{studentLabel(item.user_id)}</p>
-              <p className="text-xs text-slate-500">{item.phone_number}</p>
+              <div className="flex items-start justify-between gap-2">
+                <p className="font-medium">{studentLabel(item)}</p>
+                {!!item.unread_count && item.unread_count > 0 && (
+                  <span className="rounded-full bg-emerald-600 px-2 py-0.5 text-[10px] font-semibold text-white">
+                    {item.unread_count}
+                  </span>
+                )}
+              </div>
+              <p className="text-xs text-slate-500">{formatPhone(item.phone_number)}</p>
+              {item.last_message && (
+                <p className="mt-1 truncate text-xs text-slate-400">{item.last_message}</p>
+              )}
+              {item.is_unknown && (
+                <p className="mt-1 text-[10px] font-medium uppercase tracking-wide text-amber-600">New number</p>
+              )}
             </button>
           ))}
-          {conversations.length === 0 && <p className="p-4 text-sm text-slate-500">No WhatsApp threads for your students yet.</p>}
+          {!loading && conversations.length === 0 && (
+            <div className="space-y-2 p-4 text-sm text-slate-500">
+              <p>No WhatsApp threads yet.</p>
+              <p className="text-xs leading-relaxed">
+                When a student messages your Fly Masters WhatsApp number, the chat appears here — even if they use a
+                number not saved on their profile yet.
+              </p>
+            </div>
+          )}
         </Card>
+
         <Card className="flex max-h-[70vh] flex-col p-5">
-          {!selected && <p className="text-sm text-slate-500">Select a conversation.</p>}
+          {!selected && !loading && <p className="text-sm text-slate-500">Select a conversation.</p>}
           {selected && (
             <>
+              <div className="mb-4 border-b border-slate-100 pb-3">
+                <p className="font-semibold">{studentLabel(selected)}</p>
+                <p className="text-xs text-slate-500">{formatPhone(selected.phone_number)}</p>
+                {selected.is_unknown && (
+                  <p className="mt-2 text-xs text-amber-700">
+                    This number is not linked to a student profile yet. You can still reply here; ask them to verify
+                    WhatsApp in the student portal to link their account.
+                    {unknownCount > 1 ? ` ${unknownCount} unlinked chats total.` : ""}
+                  </p>
+                )}
+              </div>
               <div className="min-h-0 flex-1 overflow-y-auto">
                 {messages.map((item) => {
                   const fromStudent = item.direction === "inbound";
                   return (
-                    <div key={item.id} className={`mb-3 max-w-[80%] rounded-2xl px-3 py-2 text-sm ${fromStudent ? "bg-slate-100" : "ml-auto bg-emerald-600 text-white"}`}>
+                    <div
+                      key={item.id}
+                      className={`mb-3 max-w-[80%] rounded-2xl px-3 py-2 text-sm ${fromStudent ? "bg-slate-100" : "ml-auto bg-emerald-600 text-white"}`}
+                    >
                       <p>{item.body}</p>
                       <div className={`mt-1 flex flex-wrap gap-2 text-[10px] ${fromStudent ? "text-slate-400" : "text-white/70"}`}>
                         <span>{item.created_at ? format(new Date(item.created_at), "PP p") : ""}</span>
@@ -119,6 +219,7 @@ export default function WhatsAppChat() {
                     </div>
                   );
                 })}
+                {messages.length === 0 && <p className="text-sm text-slate-500">No messages yet. Waiting for a reply...</p>}
               </div>
               <div className="mt-4 flex gap-2 border-t border-slate-100 pt-4">
                 <input
