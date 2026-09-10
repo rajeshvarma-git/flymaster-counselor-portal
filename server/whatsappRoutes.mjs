@@ -1,9 +1,12 @@
 import { getWhatsAppConfig, normalizePhone, parseIncomingWebhook, verifyWhatsAppCredentials } from "./whatsapp.mjs";
 import {
   appendWhatsAppMessage,
+  canStaffReply,
   conversationVisibleToCounselor,
+  ensureCounselorWhatsAppThreads,
   ensureWhatsAppConversation,
   enrichWhatsAppConversations,
+  findLeadForConversation,
   findLeadForUser,
   getVerificationStatus,
   handleIncomingWhatsApp,
@@ -14,10 +17,17 @@ import {
   resolveSessionUser,
   sendOtpForUser,
   sendStaffWhatsAppReply,
+  syncConversationFromLead,
   verifyOtpForUser,
 } from "./whatsappStore.mjs";
 
-export function mountWhatsAppRoutes(app, { pool, verifyJwt, notify, staffRoles = ["admin", "super_admin", "counselor", "telecaller"] }) {
+export function mountWhatsAppRoutes(app, {
+  pool,
+  verifyJwt,
+  notify,
+  staffRoles = ["admin", "super_admin", "counselor", "telecaller"],
+  resolveCounselorAliases = null,
+}) {
   async function portalSession(req, res, next) {
     const header = req.headers.authorization || "";
     const token = header.startsWith("Bearer ") ? header.slice(7) : "";
@@ -32,6 +42,26 @@ export function mountWhatsAppRoutes(app, { pool, verifyJwt, notify, staffRoles =
       return res.status(403).json({ error: "Staff access required." });
     }
     next();
+  }
+
+  async function counselorAliasesFor(userId) {
+    if (typeof resolveCounselorAliases === "function") {
+      return resolveCounselorAliases(userId);
+    }
+    return new Set([String(userId)]);
+  }
+
+  async function counselorCanAccessConversation(conversationId, userId) {
+    const leads = await jsonTable(pool, "student_leads");
+    const conversations = await jsonTable(pool, "whatsapp_conversations");
+    const conversation = conversations.find((row) => String(row.id) === String(conversationId));
+    if (!conversation) return { ok: false, status: 404, error: "Conversation not found." };
+    const aliases = await counselorAliasesFor(userId);
+    if (!conversationVisibleToCounselor(conversation, aliases, leads)) {
+      return { ok: false, status: 403, error: "You do not have access to this conversation." };
+    }
+    const lead = findLeadForConversation(conversation, leads);
+    return { ok: true, conversation, lead, aliases };
   }
 
   app.get("/api/whatsapp/webhook", (req, res) => {
@@ -125,14 +155,7 @@ export function mountWhatsAppRoutes(app, { pool, verifyJwt, notify, staffRoles =
       const result = await verifyOtpForUser(pool, req.user.id, req.body.phone, req.body.code);
       if (result.error) return res.status(result.status || 400).json({ error: result.error });
       const lead = await findLeadForUser(pool, req.user.id);
-      const profile = await getVerificationStatus(pool, req.user.id);
-      await ensureWhatsAppConversation(pool, {
-        userId: req.user.id,
-        phone: profile.phone,
-        staffId: lead?.assigned_counselor_id || lead?.assigned_telecaller_id || null,
-        staffRole: lead?.assigned_counselor_id ? "counselor" : lead?.assigned_telecaller_id ? "telecaller" : null,
-        leadId: lead?.id || null,
-      });
+      if (lead) await syncConversationFromLead(pool, lead);
       res.json(result);
     } catch (error) {
       res.status(500).json({ error: error.message || "Could not verify code" });
@@ -143,16 +166,24 @@ export function mountWhatsAppRoutes(app, { pool, verifyJwt, notify, staffRoles =
     try {
       const role = req.user.role;
       const leads = await jsonTable(pool, "student_leads");
+      let aliases = null;
+      if (role === "counselor") {
+        aliases = await counselorAliasesFor(req.user.id);
+        await ensureCounselorWhatsAppThreads(pool, aliases);
+      }
       const conversations = await listWhatsAppConversations(pool, (row) => {
         if (role === "admin" || role === "super_admin") return true;
-        if (role === "counselor") return conversationVisibleToCounselor(row, req.user.id, leads);
+        if (role === "counselor") return conversationVisibleToCounselor(row, aliases, leads);
         if (role === "telecaller") {
           const lead = leads.find((item) => String(item.user_id) === String(row.user_id) || String(item.id) === String(row.lead_id));
-          return String(lead?.assigned_telecaller_id || row.assigned_staff_id || "") === String(req.user.id);
+          return String(lead?.assigned_telecaller_id || row.active_handler_id || row.assigned_staff_id || "") === String(req.user.id);
         }
         return false;
       });
-      const enriched = await enrichWhatsAppConversations(pool, conversations, leads);
+      const enriched = await enrichWhatsAppConversations(pool, conversations, leads, {
+        aliases,
+        staffRole: role,
+      });
       res.json({ conversations: enriched });
     } catch (error) {
       res.status(500).json({ error: error.message || "Could not load conversations" });
@@ -161,6 +192,10 @@ export function mountWhatsAppRoutes(app, { pool, verifyJwt, notify, staffRoles =
 
   app.get("/api/whatsapp/conversations/:id/messages", portalSession, requireStaff, async (req, res) => {
     try {
+      if (req.user.role === "counselor") {
+        const access = await counselorCanAccessConversation(req.params.id, req.user.id);
+        if (!access.ok) return res.status(access.status || 403).json({ error: access.error });
+      }
       const messages = await listWhatsAppMessages(pool, req.params.id);
       res.json({ messages });
     } catch (error) {
@@ -170,12 +205,19 @@ export function mountWhatsAppRoutes(app, { pool, verifyJwt, notify, staffRoles =
 
   app.post("/api/whatsapp/messages", portalSession, requireStaff, async (req, res) => {
     try {
+      let aliases = null;
+      if (req.user.role === "counselor") {
+        const access = await counselorCanAccessConversation(req.body.conversationId, req.user.id);
+        if (!access.ok) return res.status(access.status || 403).json({ error: access.error });
+        aliases = access.aliases;
+      }
       const result = await sendStaffWhatsAppReply(pool, {
         conversationId: req.body.conversationId,
         staffId: req.user.id,
         body: req.body.message,
         notify,
         staffRole: req.user.role === "telecaller" ? "telecaller" : "counselor",
+        aliases,
       });
       if (result.error) return res.status(result.status || 400).json({ error: result.error });
       res.json(result);
@@ -186,6 +228,10 @@ export function mountWhatsAppRoutes(app, { pool, verifyJwt, notify, staffRoles =
 
   app.post("/api/whatsapp/conversations/:id/read", portalSession, requireStaff, async (req, res) => {
     try {
+      if (req.user.role === "counselor") {
+        const access = await counselorCanAccessConversation(req.params.id, req.user.id);
+        if (!access.ok) return res.status(access.status || 403).json({ error: access.error });
+      }
       const messages = await listWhatsAppMessages(pool, req.params.id);
       for (const row of messages.filter((item) => item.direction === "inbound" && !item.is_read)) {
         await jsonUpsert(pool, "whatsapp_messages", { ...row, is_read: true });
@@ -203,13 +249,9 @@ export function mountWhatsAppRoutes(app, { pool, verifyJwt, notify, staffRoles =
       const status = await getVerificationStatus(pool, req.user.id);
       if (!status.verified) return res.status(403).json({ error: "Verify your WhatsApp number first." });
       const lead = await findLeadForUser(pool, req.user.id);
-      const conversation = await ensureWhatsAppConversation(pool, {
-        userId: req.user.id,
-        phone: status.phone,
-        staffId: lead?.assigned_counselor_id || lead?.assigned_telecaller_id || null,
-        staffRole: lead?.assigned_counselor_id ? "counselor" : lead?.assigned_telecaller_id ? "telecaller" : null,
-        leadId: lead?.id || null,
-      });
+      const conversation = lead
+        ? await syncConversationFromLead(pool, lead)
+        : await ensureWhatsAppConversation(pool, { userId: req.user.id, phone: status.phone });
       const message = await appendWhatsAppMessage(pool, {
         conversationId: conversation.id,
         direction: "inbound",
@@ -234,13 +276,9 @@ export function mountWhatsAppRoutes(app, { pool, verifyJwt, notify, staffRoles =
       const status = await getVerificationStatus(pool, req.user.id);
       if (!status.verified) return res.json({ verified: false, conversation: null, messages: [] });
       const lead = await findLeadForUser(pool, req.user.id);
-      const conversation = await ensureWhatsAppConversation(pool, {
-        userId: req.user.id,
-        phone: status.phone,
-        staffId: lead?.assigned_counselor_id || lead?.assigned_telecaller_id || null,
-        staffRole: lead?.assigned_counselor_id ? "counselor" : lead?.assigned_telecaller_id ? "telecaller" : null,
-        leadId: lead?.id || null,
-      });
+      const conversation = lead
+        ? await syncConversationFromLead(pool, lead)
+        : await ensureWhatsAppConversation(pool, { userId: req.user.id, phone: status.phone });
       const messages = await listWhatsAppMessages(pool, conversation.id);
       res.json({ verified: true, conversation, messages });
     } catch (error) {

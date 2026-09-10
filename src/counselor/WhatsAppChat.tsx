@@ -16,6 +16,9 @@ interface WhatsAppConversation {
   is_unknown?: boolean;
   last_message?: string | null;
   unread_count?: number;
+  stage?: string;
+  lead_source?: string | null;
+  canReply?: boolean;
 }
 
 interface WhatsAppMessage {
@@ -53,6 +56,7 @@ export default function WhatsAppChat() {
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [status, setStatus] = useState<WhatsAppStatus | null>(null);
   const [sendError, setSendError] = useState<string | null>(null);
 
@@ -68,9 +72,13 @@ export default function WhatsAppChat() {
         .then((data) => {
           const next = data.conversations || [];
           setConversations(next);
+          setLoadError(null);
           setSelectedId((current) => current || next[0]?.id || null);
         })
-        .catch(() => setConversations([]))
+        .catch((error) => {
+          setConversations([]);
+          setLoadError(error instanceof Error ? error.message : "Could not load WhatsApp conversations.");
+        })
         .finally(() => setLoading(false));
     void load();
     const timer = window.setInterval(load, 5000);
@@ -107,8 +115,10 @@ export default function WhatsAppChat() {
     return item.phone_number ? formatPhone(item.phone_number) : "Unknown contact";
   };
 
+  const assignedStudents = store.leads.filter((lead) => lead.entity_type === "student" || lead.lead_status === "converted");
+
   const send = async () => {
-    if (!selected?.id || !draft.trim()) return;
+    if (!selected?.id || !draft.trim() || selected.canReply === false) return;
     setSending(true);
     setSendError(null);
     const text = draft.trim();
@@ -159,6 +169,16 @@ export default function WhatsAppChat() {
         </Card>
       )}
 
+      {loadError && (
+        <Card className="mb-4 flex items-start gap-3 border-red-200 bg-red-50 p-4 text-sm text-red-900">
+          <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+          <div>
+            <p className="font-medium">Could not load WhatsApp threads</p>
+            <p className="mt-1 text-red-800">{loadError}</p>
+          </div>
+        </Card>
+      )}
+
       {sendError && (
         <Card className="mb-4 flex items-start gap-3 border-red-200 bg-red-50 p-4 text-sm text-red-900">
           <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
@@ -190,18 +210,32 @@ export default function WhatsAppChat() {
               {item.last_message && (
                 <p className="mt-1 truncate text-xs text-slate-400">{item.last_message}</p>
               )}
-              {item.is_unknown && (
-                <p className="mt-1 text-[10px] font-medium uppercase tracking-wide text-amber-600">New number</p>
-              )}
+              <div className="mt-1 flex flex-wrap gap-1">
+                {item.lead_source === "whatsapp" && (
+                  <span className="rounded bg-emerald-100 px-1.5 py-0.5 text-[10px] text-emerald-700">WhatsApp</span>
+                )}
+                {item.stage && (
+                  <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-600">{item.stage}</span>
+                )}
+                {item.is_unknown && (
+                  <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px] text-amber-700">New number</span>
+                )}
+              </div>
             </button>
           ))}
           {!loading && conversations.length === 0 && (
             <div className="space-y-2 p-4 text-sm text-slate-500">
               <p>No WhatsApp threads yet.</p>
               <p className="text-xs leading-relaxed">
-                When a student messages your Fly Masters WhatsApp number, the chat appears here — even if they use a
-                number not saved on their profile yet.
+                Threads appear here for students assigned to you who have a phone number on file, or when someone
+                messages the Fly Masters WhatsApp number.
               </p>
+              {assignedStudents.length > 0 && (
+                <p className="text-xs leading-relaxed text-slate-400">
+                  You have {assignedStudents.length} assigned student{assignedStudents.length === 1 ? "" : "s"} — once
+                  they message on WhatsApp, the chat will show here.
+                </p>
+              )}
             </div>
           )}
         </Card>
@@ -219,6 +253,9 @@ export default function WhatsAppChat() {
                     WhatsApp in the student portal to link their account.
                     {unknownCount > 1 ? ` ${unknownCount} unlinked chats total.` : ""}
                   </p>
+                )}
+                {selected.canReply === false && (
+                  <p className="mt-2 text-xs text-amber-700">This thread is read-only for you right now.</p>
                 )}
               </div>
               <div className="min-h-0 flex-1 overflow-y-auto">
@@ -254,15 +291,16 @@ export default function WhatsAppChat() {
               </div>
               <div className="mt-4 flex gap-2 border-t border-slate-100 pt-4">
                 <input
-                  className="flex-1 rounded-xl border border-slate-200 px-3 py-2 text-sm"
+                  className="flex-1 rounded-xl border border-slate-200 px-3 py-2 text-sm disabled:bg-slate-50"
                   value={draft}
                   onChange={(e) => setDraft(e.target.value)}
-                  placeholder="Reply on WhatsApp..."
+                  placeholder={selected.canReply === false ? "Read-only thread" : "Reply on WhatsApp..."}
+                  disabled={selected.canReply === false}
                   onKeyDown={(e) => {
                     if (e.key === "Enter") void send();
                   }}
                 />
-                <Button onClick={() => void send()} disabled={sending || !draft.trim()}>
+                <Button onClick={() => void send()} disabled={sending || !draft.trim() || selected.canReply === false}>
                   <Send className="h-4 w-4" />
                 </Button>
               </div>

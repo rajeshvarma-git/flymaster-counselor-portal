@@ -370,7 +370,11 @@ async function resolveCounselorAliases(portalCounselorId) {
   const email = String(found.rows[0]?.email || "").trim().toLowerCase();
   if (email) {
     const auth = await pool.query("SELECT id FROM auth_users WHERE lower(email) = $1", [email]).catch(() => ({ rows: [] }));
-    if (auth.rows[0]?.id) aliases.add(String(auth.rows[0].id));
+    const authId = auth.rows[0]?.id ? String(auth.rows[0].id) : "";
+    if (authId) {
+      aliases.add(authId);
+      aliases.add(`counselor-${authId}`);
+    }
     const roles = await jsonTable("user_roles").catch(() => []);
     for (const role of roles.filter((row) => row.role === "counselor")) {
       const authRow = auth.rows.find((item) => String(item.id) === String(role.user_id));
@@ -380,8 +384,13 @@ async function resolveCounselorAliases(portalCounselorId) {
     }
     const counselors = await jsonTable("counselors").catch(() => []);
     for (const row of counselors) {
-      const authMatch = auth.rows.some((item) => String(item.id) === String(row.user_id));
-      if (authMatch) aliases.add(String(row.user_id));
+      const rowUserId = String(row.user_id || "");
+      const rowId = String(row.id || "");
+      const authMatch = auth.rows.some((item) => String(item.id) === rowUserId);
+      if (authMatch || rowUserId === authId || rowUserId === String(portalCounselorId)) {
+        if (rowId) aliases.add(rowId);
+        if (rowUserId) aliases.add(rowUserId);
+      }
     }
   }
   return aliases;
@@ -2192,6 +2201,7 @@ mountWhatsAppRoutes(app, {
   },
   notify: notifyCounselor,
   staffRoles: ["counselor"],
+  resolveCounselorAliases,
 });
 
 app.use("/api", (_req, res) => {
