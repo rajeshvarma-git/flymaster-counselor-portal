@@ -24,6 +24,7 @@ interface WhatsAppMessage {
   direction: "inbound" | "outbound";
   body: string;
   channel?: string;
+  kind?: string;
   delivery_status?: string;
   created_at: string;
 }
@@ -222,6 +223,14 @@ export default function WhatsAppChat() {
               </div>
               <div className="min-h-0 flex-1 overflow-y-auto">
                 {messages.map((item) => {
+                  const system = item.channel === "system" || item.kind === "system";
+                  if (system) {
+                    return (
+                      <p key={item.id} className="mb-3 text-center text-[11px] text-slate-500">
+                        {item.body}
+                      </p>
+                    );
+                  }
                   const fromStudent = item.direction === "inbound";
                   return (
                     <div
